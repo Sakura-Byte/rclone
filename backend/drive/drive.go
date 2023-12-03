@@ -26,7 +26,6 @@ import (
 	"text/template"
 	"time"
 
-	"io/ioutil"
 	"math/rand"
 	"path/filepath"
 	"regexp"
@@ -773,7 +772,7 @@ func (p *ServiceAccountPool) Load(opt *Options) (map[string]struct{}, error) {
 	saFolder := opt.ServiceAccountFilePath
 	if len(saFolder) > 0 {
 		fs.Debugf(nil, "Loading Service Account File(s) from %q", saFolder)
-		files, err := ioutil.ReadDir(saFolder)
+		files, err := os.ReadDir(saFolder)
 		if err != nil {
 			return nil, fmt.Errorf("error loading service account from folder: %w", err)
 		}
@@ -901,7 +900,7 @@ func (p *ServiceAccountPool) GetFile(remove bool) (file string, err error) {
 
 func createDriveService(ctx context.Context, opt *Options, file string) (svc ServiceAccountInfo, err error) {
 	// fs.Debugf(nil, "Preloading Service Account File from %s", file)
-	loadedCreds, err := ioutil.ReadFile(os.ExpandEnv(file))
+	loadedCreds, err := os.ReadFile(os.ExpandEnv(file))
 	if err != nil {
 		err = fmt.Errorf("error opening service account credentials file: %w", err)
 		return
@@ -3860,7 +3859,7 @@ func (f *Fs) addDrive(ctx context.Context, name string, srcFs *Fs, replaceMember
 func (f *Fs) deleteDrive(ctx context.Context, force bool) (err error) {
 	driveID := f.opt.TeamDriveID
 	if driveID == "" {
-		return fmt.Errorf("Invalid team drive id", err)
+		return fmt.Errorf("Invalid team drive id: %v", err)
 	}
 
 	// Get drive
