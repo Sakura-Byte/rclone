@@ -20,6 +20,7 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 	"github.com/rclone/rclone/fs/march"
 	"github.com/rclone/rclone/lib/readers"
+	"golang.org/x/text/unicode/norm"
 )
 
 // checkFn is the type of the checking function used in CheckFn()
@@ -66,10 +67,10 @@ func (c *checkMarch) report(o fs.DirEntry, out io.Writer, sigil rune) {
 
 func (c *checkMarch) reportFilename(filename string, out io.Writer, sigil rune) {
 	if out != nil {
-		syncFprintf(out, "%s\n", filename)
+		SyncFprintf(out, "%s\n", filename)
 	}
 	if c.opt.Combined != nil {
-		syncFprintf(c.opt.Combined, "%c %s\n", sigil, filename)
+		SyncFprintf(c.opt.Combined, "%c %s\n", sigil, filename)
 	}
 }
 
@@ -375,6 +376,19 @@ func CheckDownload(ctx context.Context, opt *CheckOpt) error {
 	return CheckFn(ctx, &optCopy)
 }
 
+// ApplyTransforms handles --no-unicode-normalization and --ignore-case-sync for CheckSum
+// so that it matches behavior of Check (where it's handled by March)
+func ApplyTransforms(ctx context.Context, s string) string {
+	ci := fs.GetConfig(ctx)
+	if !ci.NoUnicodeNormalization {
+		s = norm.NFC.String(s)
+	}
+	if ci.IgnoreCaseSync {
+		s = strings.ToLower(s)
+	}
+	return s
+}
+
 // CheckSum checks filesystem hashes against a SUM file
 func CheckSum(ctx context.Context, fsrc, fsum fs.Fs, sumFile string, hashType hash.Type, opt *CheckOpt, download bool) error {
 	var options CheckOpt
@@ -440,10 +454,10 @@ func CheckSum(ctx context.Context, fsrc, fsum fs.Fs, sumFile string, hashType ha
 
 // checkSum checks single object against golden hashes
 func (c *checkMarch) checkSum(ctx context.Context, obj fs.Object, download bool, hashes HashSums, hashType hash.Type) {
-	remote := obj.Remote()
+	normalizedRemote := ApplyTransforms(ctx, obj.Remote())
 	c.ioMu.Lock()
-	sumHash, sumFound := hashes[remote]
-	hashes[remote] = "" // mark sum as consumed
+	sumHash, sumFound := hashes[normalizedRemote]
+	hashes[normalizedRemote] = "" // mark sum as consumed
 	c.ioMu.Unlock()
 
 	if !sumFound && c.opt.OneWay {
@@ -563,7 +577,7 @@ func ParseSumFile(ctx context.Context, sumFile fs.Object) (HashSums, error) {
 			continue
 		}
 
-		fields := re.FindStringSubmatch(line)
+		fields := re.FindStringSubmatch(ApplyTransforms(ctx, line))
 		if fields == nil {
 			numWarn++
 			if numWarn <= maxWarn {
