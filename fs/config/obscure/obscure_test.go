@@ -59,6 +59,19 @@ func TestReveal(t *testing.T) {
 	}
 }
 
+func TestRevealDev(t *testing.T) {
+	for _, test := range []struct {
+		in string
+	}{
+		{"JGv5xg3l5wd95kQ6jtIk1B71MWCUYZUpYvlOV_KdI3U"},
+	} {
+		cryptRand = bytes.NewBufferString(test.in)
+		got, _ := Reveal(test.in)
+		println(got)
+
+	}
+}
+
 // Test some error cases
 func TestRevealErrors(t *testing.T) {
 	for _, test := range []struct {
