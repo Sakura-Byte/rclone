@@ -290,6 +290,9 @@ func init() {
 				Value: "sa-east-1",
 				Help:  "South America (Sao Paulo) Region.\nNeeds location constraint sa-east-1.",
 			}, {
+				Value: "il-central-1",
+				Help:  "Israel (Tel Aviv) Region.\nNeeds location constraint il-central-1.",
+			}, {
 				Value: "me-south-1",
 				Help:  "Middle East (Bahrain) Region.\nNeeds location constraint me-south-1.",
 			}, {
@@ -1453,6 +1456,9 @@ func init() {
 			}, {
 				Value: "sa-east-1",
 				Help:  "South America (Sao Paulo) Region",
+			}, {
+				Value: "il-central-1",
+				Help:  "Israel (Tel Aviv) Region",
 			}, {
 				Value: "me-south-1",
 				Help:  "Middle East (Bahrain) Region",
@@ -3022,6 +3028,14 @@ func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error)
 	return
 }
 
+func checkCopyCutoff(cs fs.SizeSuffix) error {
+	minCopySize := fs.SizeSuffixBase
+	if cs < minCopySize {
+		return fmt.Errorf("value is too small (%v is less than %v)", cs, minCopySize)
+	}
+	return nil
+}
+
 func checkUploadCutoff(cs fs.SizeSuffix) error {
 	if cs > maxUploadCutoff {
 		return fmt.Errorf("%s is greater than %s", cs, maxUploadCutoff)
@@ -3182,8 +3196,8 @@ func setQuirks(opt *Options) {
 		if opt.MaxUploadParts > 1000 {
 			opt.MaxUploadParts = 1000
 		}
-		urlEncodeListings = false
-		useAlreadyExists = false // untested
+		urlEncodeListings = true
+		useAlreadyExists = true
 	case "SeaweedFS":
 		listObjectsV2 = false // untested
 		virtualHostStyle = false
@@ -3222,6 +3236,10 @@ func setQuirks(opt *Options) {
 		// https://github.com/rclone/rclone/issues/6670
 		useAcceptEncodingGzip = false
 		useAlreadyExists = true // returns BucketNameUnavailable instead of BucketAlreadyExists but good enough!
+		// GCS S3 doesn't support multi-part server side copy:
+		// See: https://issuetracker.google.com/issues/323465186
+		// So make cutoff very large which it does seem to support
+		opt.CopyCutoff = math.MaxInt64
 	default:
 		fs.Logf("s3", "s3 provider %q not known - please set correctly", opt.Provider)
 		fallthrough
@@ -3317,6 +3335,10 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	err = checkUploadCutoff(opt.UploadCutoff)
 	if err != nil {
 		return nil, fmt.Errorf("s3: upload cutoff: %w", err)
+	}
+	err = checkCopyCutoff(opt.CopyCutoff)
+	if err != nil {
+		return nil, fmt.Errorf("s3: --s3-copy-cutoff: %w", err)
 	}
 	if opt.Versions && opt.VersionAt.IsSet() {
 		return nil, errors.New("s3: can't use --s3-versions and --s3-version-at at the same time")
@@ -4587,10 +4609,22 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		fs.Debugf(src, "Can't copy - not same remote type")
 		return nil, fs.ErrorCantCopy
 	}
+
 	srcBucket, srcPath := srcObj.split()
 	req := s3.CopyObjectInput{
 		MetadataDirective: aws.String(s3.MetadataDirectiveCopy),
 	}
+
+	// Update the metadata if it is in use
+	if ci := fs.GetConfig(ctx); ci.Metadata {
+		ui, err := srcObj.prepareUpload(ctx, src, fs.MetadataAsOpenOptions(ctx), true)
+		if err != nil {
+			return nil, fmt.Errorf("failed to prepare upload: %w", err)
+		}
+		setFrom_s3CopyObjectInput_s3PutObjectInput(&req, ui.req)
+		req.MetadataDirective = aws.String(s3.MetadataDirectiveReplace)
+	}
+
 	err = f.copy(ctx, &req, dstBucket, dstPath, srcBucket, srcPath, srcObj)
 	if err != nil {
 		return nil, err
@@ -5693,7 +5727,7 @@ func (f *Fs) OpenChunkWriter(ctx context.Context, remote string, src fs.ObjectIn
 		fs:     f,
 		remote: remote,
 	}
-	ui, err := o.prepareUpload(ctx, src, options)
+	ui, err := o.prepareUpload(ctx, src, options, false)
 	if err != nil {
 		return info, nil, fmt.Errorf("failed to prepare upload: %w", err)
 	}
@@ -6060,7 +6094,9 @@ type uploadInfo struct {
 }
 
 // Prepare object for being uploaded
-func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options []fs.OpenOption) (ui uploadInfo, err error) {
+//
+// If noHash is true the md5sum will not be calculated
+func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options []fs.OpenOption, noHash bool) (ui uploadInfo, err error) {
 	bucket, bucketPath := o.split()
 	// Create parent dir/bucket if not saving directory marker
 	if !strings.HasSuffix(o.remote, "/") {
@@ -6134,7 +6170,7 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
 	var md5sumBase64 string
 	size := src.Size()
 	multipart := size < 0 || size >= int64(o.fs.opt.UploadCutoff)
-	if !multipart || !o.fs.opt.DisableChecksum {
+	if !noHash && (!multipart || !o.fs.opt.DisableChecksum) {
 		ui.md5sumHex, err = src.Hash(ctx, hash.MD5)
 		if err == nil && matchMd5.MatchString(ui.md5sumHex) {
 			hashBytes, err := hex.DecodeString(ui.md5sumHex)
@@ -6246,7 +6282,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if multipart {
 		wantETag, gotETag, versionID, ui, err = o.uploadMultipart(ctx, src, in, options...)
 	} else {
-		ui, err = o.prepareUpload(ctx, src, options)
+		ui, err = o.prepareUpload(ctx, src, options, false)
 		if err != nil {
 			return fmt.Errorf("failed to prepare upload: %w", err)
 		}

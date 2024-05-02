@@ -35,6 +35,7 @@ import (
 	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/walk"
 	"github.com/rclone/rclone/lib/atexit"
+	"github.com/rclone/rclone/lib/errcount"
 	"github.com/rclone/rclone/lib/random"
 	"github.com/rclone/rclone/lib/readers"
 	"golang.org/x/sync/errgroup"
@@ -140,6 +141,40 @@ func Equal(ctx context.Context, src fs.ObjectInfo, dst fs.Object) bool {
 	return equal(ctx, src, dst, defaultEqualOpt(ctx))
 }
 
+// DirsEqual is like Equal but for dirs instead of objects.
+// It returns true if two dirs should be considered "equal" for the purposes of syncCopyMove
+// (in other words, true == "skip updating modtime/metadata for this dir".)
+// Unlike Equal, it does not consider size or checksum, as these do not apply to directories.
+func DirsEqual(ctx context.Context, src, dst fs.Directory, opt DirsEqualOpt) (equal bool) {
+	if dst == nil {
+		return false
+	}
+	ci := fs.GetConfig(ctx)
+	if ci.SizeOnly || ci.Immutable || ci.IgnoreExisting || opt.ModifyWindow == fs.ModTimeNotSupported {
+		return true
+	}
+	if ci.IgnoreTimes {
+		return false
+	}
+	if !(opt.SetDirModtime || opt.SetDirMetadata) {
+		return true
+	}
+	srcModTime, dstModTime := src.ModTime(ctx), dst.ModTime(ctx)
+	if srcModTime.IsZero() || dstModTime.IsZero() {
+		return false
+	}
+	dt := dstModTime.Sub(srcModTime)
+	if dt < opt.ModifyWindow && dt > -opt.ModifyWindow {
+		fs.Debugf(dst, "Directory modification time the same (differ by %s, within tolerance %s)", dt, opt.ModifyWindow)
+		return true
+	}
+	if ci.UpdateOlder && dt >= opt.ModifyWindow {
+		fs.Debugf(dst, "Destination directory is newer than source, skipping")
+		return true
+	}
+	return false
+}
+
 // sizeDiffers compare the size of src and dst taking into account the
 // various ways of ignoring sizes
 func sizeDiffers(ctx context.Context, src, dst fs.ObjectInfo) bool {
@@ -171,6 +206,13 @@ func defaultEqualOpt(ctx context.Context) equalOpt {
 	}
 }
 
+// DirsEqualOpt represents options for DirsEqual function()
+type DirsEqualOpt struct {
+	ModifyWindow   time.Duration // Max time diff to be considered the same
+	SetDirModtime  bool          // whether to consider dir modtime
+	SetDirMetadata bool          // whether to consider dir metadata
+}
+
 var modTimeUploadOnce sync.Once
 
 // emit a log if we are about to upload a file to set its modification time
@@ -181,8 +223,10 @@ func logModTimeUpload(dst fs.Object) {
 }
 
 // EqualFn allows replacing Equal() with a custom function during NeedTransfer()
-type EqualFn func(ctx context.Context, src fs.ObjectInfo, dst fs.Object) bool
-type equalFnContextKey struct{}
+type (
+	EqualFn           func(ctx context.Context, src fs.ObjectInfo, dst fs.Object) bool
+	equalFnContextKey struct{}
+)
 
 var equalFnKey = equalFnContextKey{}
 
@@ -382,7 +426,7 @@ func move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.
 	ci := fs.GetConfig(ctx)
 	var tr *accounting.Transfer
 	if isTransfer {
-		tr = accounting.Stats(ctx).NewTransfer(src)
+		tr = accounting.Stats(ctx).NewTransfer(src, fdst)
 	} else {
 		tr = accounting.Stats(ctx).NewCheckingTransfer(src, "moving")
 	}
@@ -401,10 +445,21 @@ func move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.
 	// See if we have Move available
 	if doMove := fdst.Features().Move; doMove != nil && (SameConfig(src.Fs(), fdst) || (SameRemoteType(src.Fs(), fdst) && (fdst.Features().ServerSideAcrossConfigs || ci.ServerSideAcrossConfigs))) {
 		// Delete destination if it exists and is not the same file as src (could be same file while seemingly different if the remote is case insensitive)
-		if dst != nil && !SameObject(src, dst) {
-			err = DeleteFile(ctx, dst)
-			if err != nil {
-				return newDst, err
+		if dst != nil {
+			remote = dst.Remote()
+			if !SameObject(src, dst) {
+				err = DeleteFile(ctx, dst)
+				if err != nil {
+					return newDst, err
+				}
+			} else if needsMoveCaseInsensitive(fdst, fdst, remote, src.Remote(), false) {
+				doMove = func(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+					return MoveCaseInsensitive(ctx, fdst, fdst, remote, src.Remote(), false, src)
+				}
+			}
+		} else if needsMoveCaseInsensitive(fdst, fdst, remote, src.Remote(), false) {
+			doMove = func(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+				return MoveCaseInsensitive(ctx, fdst, fdst, remote, src.Remote(), false, src)
 			}
 		}
 		// Move dst <- src
@@ -814,7 +869,7 @@ func HashSum(ctx context.Context, ht hash.Type, base64Encoded bool, downloadFlag
 		// Setup: Define accounting, open the file with NewReOpen to provide restarts, account for the transfer, and setup a multi-hasher with the appropriate type
 		// Execution: io.Copy file to hasher, get hash and encode in hex
 
-		tr := accounting.Stats(ctx).NewTransfer(o)
+		tr := accounting.Stats(ctx).NewTransfer(o, nil)
 		defer func() {
 			tr.Done(ctx, err)
 		}()
@@ -979,6 +1034,65 @@ func Mkdir(ctx context.Context, f fs.Fs, dir string) error {
 	return nil
 }
 
+// MkdirMetadata makes a destination directory or container with metadata
+//
+// If the destination Fs doesn't support this it will fall back to
+// Mkdir and in this case newDst will be nil.
+func MkdirMetadata(ctx context.Context, f fs.Fs, dir string, metadata fs.Metadata) (newDst fs.Directory, err error) {
+	do := f.Features().MkdirMetadata
+	if do == nil {
+		return nil, Mkdir(ctx, f, dir)
+	}
+	logName := fs.LogDirName(f, dir)
+	if SkipDestructive(ctx, logName, "make directory") {
+		return nil, nil
+	}
+	fs.Debugf(fs.LogDirName(f, dir), "Making directory with metadata")
+	newDst, err = do(ctx, dir, metadata)
+	if err != nil {
+		err = fs.CountError(err)
+		return nil, err
+	}
+	if mtime, ok := metadata["mtime"]; ok {
+		fs.Infof(logName, "Made directory with metadata (mtime=%s)", mtime)
+	} else {
+		fs.Infof(logName, "Made directory with metadata")
+	}
+	return newDst, err
+}
+
+// MkdirModTime makes a destination directory or container with modtime
+//
+// It will try to make the directory with MkdirMetadata and if that
+// succeeds it will return a non-nil newDst. In all other cases newDst
+// will be nil.
+//
+// If the directory was created with MkDir then it will attempt to use
+// Fs.DirSetModTime to update the directory modtime if available.
+func MkdirModTime(ctx context.Context, f fs.Fs, dir string, modTime time.Time) (newDst fs.Directory, err error) {
+	logName := fs.LogDirName(f, dir)
+	if SkipDestructive(ctx, logName, "make directory") {
+		return nil, nil
+	}
+	metadata := fs.Metadata{
+		"mtime": modTime.Format(time.RFC3339Nano),
+	}
+	newDst, err = MkdirMetadata(ctx, f, dir, metadata)
+	if err != nil {
+		return nil, err
+	}
+	if newDst != nil {
+		// The directory was created and we have logged already
+		return newDst, nil
+	}
+	// The directory was created with Mkdir then we should try to set the time
+	if do := f.Features().DirSetModTime; do != nil {
+		err = do(ctx, dir, modTime)
+	}
+	fs.Infof(logName, "Made directory with modification time %v", modTime)
+	return newDst, err
+}
+
 // TryRmdir removes a container but not if not empty.  It doesn't
 // count errors but may return one.
 func TryRmdir(ctx context.Context, f fs.Fs, dir string) error {
@@ -1106,7 +1220,7 @@ func Cat(ctx context.Context, f fs.Fs, w io.Writer, offset, count int64, sep []b
 	ci := fs.GetConfig(ctx)
 	return ListFn(ctx, f, func(o fs.Object) {
 		var err error
-		tr := accounting.Stats(ctx).NewTransfer(o)
+		tr := accounting.Stats(ctx).NewTransfer(o, nil)
 		defer func() {
 			tr.Done(ctx, err)
 		}()
@@ -1157,7 +1271,7 @@ func Cat(ctx context.Context, f fs.Fs, w io.Writer, offset, count int64, sep []b
 // Rcat reads data from the Reader until EOF and uploads it to a file on remote
 func Rcat(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadCloser, modTime time.Time, meta fs.Metadata) (dst fs.Object, err error) {
 	ci := fs.GetConfig(ctx)
-	tr := accounting.Stats(ctx).NewTransferRemoteSize(dstFileName, -1)
+	tr := accounting.Stats(ctx).NewTransferRemoteSize(dstFileName, -1, nil, fdst)
 	defer func() {
 		tr.Done(ctx, err)
 	}()
@@ -1346,11 +1460,7 @@ func Rmdirs(ctx context.Context, f fs.Fs, dir string, leaveRoot bool) error {
 		}
 	}
 
-	var (
-		errMu     sync.Mutex
-		errCount  int
-		lastError error
-	)
+	errCount := errcount.New()
 	// Delete all directories at the same level in parallel
 	for level := len(toDelete) - 1; level >= 0; level-- {
 		dirs := toDelete[level]
@@ -1372,10 +1482,7 @@ func Rmdirs(ctx context.Context, f fs.Fs, dir string, leaveRoot bool) error {
 				if err != nil {
 					err = fs.CountError(err)
 					fs.Errorf(dir, "Failed to rmdir: %v", err)
-					errMu.Lock()
-					lastError = err
-					errCount += 1
-					errMu.Unlock()
+					errCount.Add(err)
 				}
 				return nil // don't return errors, just count them
 			})
@@ -1385,10 +1492,7 @@ func Rmdirs(ctx context.Context, f fs.Fs, dir string, leaveRoot bool) error {
 			return err
 		}
 	}
-	if lastError != nil {
-		return fmt.Errorf("failed to remove %d directories: last error: %w", errCount, lastError)
-	}
-	return nil
+	return errCount.Err("failed to remove directories")
 }
 
 // GetCompareDest sets up --compare-dest
@@ -1603,7 +1707,7 @@ func RcatSize(ctx context.Context, fdst fs.Fs, dstFileName string, in io.ReadClo
 	if size >= 0 {
 		var err error
 		// Size known use Put
-		tr := accounting.Stats(ctx).NewTransferRemoteSize(dstFileName, size)
+		tr := accounting.Stats(ctx).NewTransferRemoteSize(dstFileName, size, nil, fdst)
 		defer func() {
 			tr.Done(ctx, err)
 		}()
@@ -1676,7 +1780,6 @@ func copyURLFn(ctx context.Context, dstFileName string, url string, autoFilename
 
 // CopyURL copies the data from the url to (fdst, dstFileName)
 func CopyURL(ctx context.Context, fdst fs.Fs, dstFileName string, url string, autoFilename, dstFileNameFromHeader bool, noClobber bool) (dst fs.Object, err error) {
-
 	err = copyURLFn(ctx, dstFileName, url, autoFilename, dstFileNameFromHeader, func(ctx context.Context, dstFileName string, in io.ReadCloser, size int64, modTime time.Time) (err error) {
 		if noClobber {
 			_, err = fdst.NewObject(ctx, dstFileName)
@@ -1746,6 +1849,55 @@ func MoveBackupDir(ctx context.Context, backupDir fs.Fs, dst fs.Object) (err err
 	return err
 }
 
+// needsMoveCaseInsensitive returns true if moveCaseInsensitive is needed
+func needsMoveCaseInsensitive(fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFileName string, cp bool) bool {
+	dstFilePath := path.Join(fdst.Root(), dstFileName)
+	srcFilePath := path.Join(fsrc.Root(), srcFileName)
+	return !cp && fdst.Name() == fsrc.Name() && fdst.Features().CaseInsensitive && dstFileName != srcFileName && strings.EqualFold(dstFilePath, srcFilePath)
+}
+
+// MoveCaseInsensitive handles changing case of a file on a case insensitive remote.
+// This will move the file to a temporary name then
+// move it back to the intended destination. This is required
+// to avoid issues with certain remotes and avoid file deletion.
+// returns nil, nil if !needsMoveCaseInsensitive.
+// this does not account a transfer -- the caller should do that if desired.
+func MoveCaseInsensitive(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFileName string, cp bool, srcObj fs.Object) (newDst fs.Object, err error) {
+	logger, _ := GetLogger(ctx)
+
+	// Choose operations
+	Op := MoveTransfer
+	if cp {
+		Op = Copy
+	}
+
+	if SkipDestructive(ctx, srcFileName, "rename to "+dstFileName) {
+		// avoid fatalpanic on --dry-run (trying to access non-existent tmpObj)
+		return nil, nil
+	}
+	// Create random name to temporarily move file to
+	tmpObjName := dstFileName + "-rclone-move-" + random.String(8)
+	tmpObjFail, err := fdst.NewObject(ctx, tmpObjName)
+	if err != fs.ErrorObjectNotFound {
+		if err == nil {
+			logger(ctx, TransferError, nil, tmpObjFail, err)
+			return nil, errors.New("found an already existing file with a randomly generated name. Try the operation again")
+		}
+		logger(ctx, TransferError, nil, tmpObjFail, err)
+		return nil, fmt.Errorf("error while attempting to move file to a temporary location: %w", err)
+	}
+	fs.Debugf(srcObj, "moving to %v", tmpObjName)
+	tmpObj, err := Op(ctx, fdst, nil, tmpObjName, srcObj)
+	if err != nil {
+		logger(ctx, TransferError, srcObj, tmpObj, err)
+		return nil, fmt.Errorf("error while moving file to temporary location: %w", err)
+	}
+	fs.Debugf(srcObj, "moving to %v", dstFileName)
+	newDst, err = Op(ctx, fdst, nil, dstFileName, tmpObj)
+	logger(ctx, MissingOnDst, tmpObj, nil, err)
+	return newDst, err
+}
+
 // moveOrCopyFile moves or copies a single file possibly to a new name
 func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName string, srcFileName string, cp bool) (err error) {
 	ci := fs.GetConfig(ctx)
@@ -1791,33 +1943,12 @@ func moveOrCopyFile(ctx context.Context, fdst fs.Fs, fsrc fs.Fs, dstFileName str
 	// This will move the file to a temporary name then
 	// move it back to the intended destination. This is required
 	// to avoid issues with certain remotes and avoid file deletion.
-	if !cp && fdst.Name() == fsrc.Name() && fdst.Features().CaseInsensitive && dstFileName != srcFileName && strings.EqualFold(dstFilePath, srcFilePath) {
-		if SkipDestructive(ctx, srcFileName, "rename to "+dstFileName) {
-			// avoid fatalpanic on --dry-run (trying to access non-existent tmpObj)
-			return nil
-		}
-		// Create random name to temporarily move file to
-		tmpObjName := dstFileName + "-rclone-move-" + random.String(8)
-		tmpObjFail, err := fdst.NewObject(ctx, tmpObjName)
-		if err != fs.ErrorObjectNotFound {
-			if err == nil {
-				logger(ctx, TransferError, nil, tmpObjFail, err)
-				return errors.New("found an already existing file with a randomly generated name. Try the operation again")
-			}
-			logger(ctx, TransferError, nil, tmpObjFail, err)
-			return fmt.Errorf("error while attempting to move file to a temporary location: %w", err)
-		}
-		tr := accounting.Stats(ctx).NewTransfer(srcObj)
+	if needsMoveCaseInsensitive(fdst, fsrc, dstFileName, srcFileName, cp) {
+		tr := accounting.Stats(ctx).NewTransfer(srcObj, fdst)
 		defer func() {
 			tr.Done(ctx, err)
 		}()
-		tmpObj, err := Op(ctx, fdst, nil, tmpObjName, srcObj)
-		if err != nil {
-			logger(ctx, TransferError, srcObj, tmpObj, err)
-			return fmt.Errorf("error while moving file to temporary location: %w", err)
-		}
-		_, err = Op(ctx, fdst, nil, dstFileName, tmpObj)
-		logger(ctx, MissingOnDst, tmpObj, nil, err)
+		_, err = MoveCaseInsensitive(ctx, fdst, fsrc, dstFileName, srcFileName, cp, srcObj)
 		return err
 	}
 
@@ -2180,7 +2311,10 @@ func DirMove(ctx context.Context, f fs.Fs, srcRemote, dstRemote string) (err err
 		if err == nil {
 			accounting.Stats(ctx).Renames(1)
 		}
-		return err
+		if err != fs.ErrorCantDirMove && err != fs.ErrorDirExists {
+			return err
+		}
+		fs.Infof(f, "Can't DirMove - falling back to file moves: %v", err)
 	}
 
 	// Load the directory tree into memory
@@ -2249,6 +2383,17 @@ func DirMove(ctx context.Context, f fs.Fs, srcRemote, dstRemote string) (err err
 	}
 
 	return nil
+}
+
+// DirMoveCaseInsensitive does DirMove in two steps (to temp name, then real name)
+// which is necessary for some case-insensitive backends
+func DirMoveCaseInsensitive(ctx context.Context, f fs.Fs, srcRemote, dstRemote string) (err error) {
+	tmpDstRemote := dstRemote + "-rclone-move-" + random.String(8)
+	err = DirMove(ctx, f, srcRemote, tmpDstRemote)
+	if err != nil {
+		return err
+	}
+	return DirMove(ctx, f, tmpDstRemote, dstRemote)
 }
 
 // FsInfo provides information about a remote
@@ -2386,4 +2531,126 @@ func SkipDestructive(ctx context.Context, subject interface{}, action string) (s
 		}
 	}
 	return skip
+}
+
+// Return the best way of describing the directory for the logs
+func dirName(f fs.Fs, dst fs.Directory, dir string) any {
+	if dst != nil {
+		if dst.Remote() != "" {
+			return dst
+		}
+		// Root is described as the Fs
+		return f
+	}
+	if dir != "" {
+		return dir
+	}
+	// Root is described as the Fs
+	return f
+}
+
+// CopyDirMetadata copies the src directory to dst or f if nil.  If dst is nil then it uses
+// dir as the name of the new directory.
+//
+// It returns the destination directory if possible.  Note that this may
+// be nil.
+func CopyDirMetadata(ctx context.Context, f fs.Fs, dst fs.Directory, dir string, src fs.Directory) (newDst fs.Directory, err error) {
+	ci := fs.GetConfig(ctx)
+	logName := dirName(f, dst, dir)
+	if SkipDestructive(ctx, logName, "update directory metadata") {
+		return nil, nil
+	}
+
+	// Options for the directory metadata
+	options := []fs.OpenOption{}
+	if ci.MetadataSet != nil {
+		options = append(options, fs.MetadataOption(ci.MetadataSet))
+	}
+
+	// Read metadata from src and add options and use metadata mapper
+	metadata, err := fs.GetMetadataOptions(ctx, f, src, options)
+	if err != nil {
+		return nil, err
+	}
+
+	// Fall back to ModTime if metadata not available
+	if metadata == nil {
+		metadata = fs.Metadata{}
+	}
+	if metadata["mtime"] == "" {
+		metadata["mtime"] = src.ModTime(ctx).Format(time.RFC3339Nano)
+	}
+
+	// Now set the metadata
+	if dst == nil {
+		do := f.Features().MkdirMetadata
+		if do == nil {
+			return nil, fmt.Errorf("internal error: expecting %v to have MkdirMetadata method: %w", f, fs.ErrorNotImplemented)
+		}
+		newDst, err = do(ctx, dir, metadata)
+	} else {
+		do, ok := dst.(fs.SetMetadataer)
+		if !ok {
+			return nil, fmt.Errorf("internal error: expecting directory %s (%T) from %v to have SetMetadata method: %w", logName, dst, f, fs.ErrorNotImplemented)
+		}
+		err = do.SetMetadata(ctx, metadata)
+		newDst = dst
+	}
+	if err != nil {
+		return nil, err
+	}
+	fs.Infof(logName, "Updated directory metadata")
+	return newDst, nil
+}
+
+// SetDirModTime sets the modtime on dst or dir
+//
+// If dst is nil then it uses dir as the name of the directory.
+//
+// It returns the destination directory if possible. Note that this
+// may be nil.
+//
+// It does not create the directory.
+func SetDirModTime(ctx context.Context, f fs.Fs, dst fs.Directory, dir string, modTime time.Time) (newDst fs.Directory, err error) {
+	logName := dirName(f, dst, dir)
+	ci := fs.GetConfig(ctx)
+	if ci.NoUpdateDirModTime {
+		fs.Debugf(logName, "Skipping set directory modification time as --no-update-dir-modtime is set")
+		return nil, nil
+	}
+	if SkipDestructive(ctx, logName, "set directory modification time") {
+		return nil, nil
+	}
+	if dst != nil {
+		dir = dst.Remote()
+	}
+
+	// Try to set the ModTime with the Directory.SetModTime method first as this is the most efficient
+	if dst != nil {
+		if do, ok := dst.(fs.SetModTimer); ok {
+			err := do.SetModTime(ctx, modTime)
+			if errors.Is(err, fs.ErrorNotImplemented) {
+				// Fall through and run the code below if not implemented
+				// This can happen for fs.DirWrapper instances
+			} else if err != nil {
+				return dst, err
+			} else {
+				fs.Infof(logName, "Set directory modification time (using SetModTime)")
+				return dst, nil
+			}
+		}
+	}
+
+	// Next try to set the ModTime with the Fs.DirSetModTime method as this works for non-metadata backends
+	if do := f.Features().DirSetModTime; do != nil {
+		err := do(ctx, dir, modTime)
+		if err != nil {
+			return dst, err
+		}
+		fs.Infof(logName, "Set directory modification time (using DirSetModTime)")
+		return dst, nil
+	}
+
+	// Something should have worked so return an error
+	return nil, fmt.Errorf("no method to set directory modtime found for %v (%T): %w", f, dst, fs.ErrorNotImplemented)
 }
