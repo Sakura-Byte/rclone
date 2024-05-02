@@ -757,14 +757,15 @@ type Fs struct {
 }
 
 type baseObject struct {
-	fs           *Fs      // what this object is part of
-	remote       string   // The remote path
-	id           string   // Drive Id of this object
-	modifiedDate string   // RFC3339 time it was last modified
-	mimeType     string   // The object MIME type
-	bytes        int64    // size of the object
-	parents      []string // IDs of the parent directories
-	resourceKey  *string  // resourceKey is needed for link shared objects
+	fs           *Fs          // what this object is part of
+	remote       string       // The remote path
+	id           string       // Drive Id of this object
+	modifiedDate string       // RFC3339 time it was last modified
+	mimeType     string       // The object MIME type
+	bytes        int64        // size of the object
+	parents      []string     // IDs of the parent directories
+	resourceKey  *string      // resourceKey is needed for link shared objects
+	metadata     *fs.Metadata // metadata if known
 }
 type documentObject struct {
 	baseObject
