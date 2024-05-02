@@ -154,6 +154,41 @@ var (
 	_linkTemplates   map[string]*template.Template // available link types
 )
 
+// rwChoices type for fs.Bits
+type rwChoices struct{}
+
+func (rwChoices) Choices() []fs.BitsChoicesInfo {
+	return []fs.BitsChoicesInfo{
+		{Bit: uint64(rwOff), Name: "off"},
+		{Bit: uint64(rwRead), Name: "read"},
+		{Bit: uint64(rwWrite), Name: "write"},
+	}
+}
+
+// rwChoice type alias
+type rwChoice = fs.Bits[rwChoices]
+
+const (
+	rwRead rwChoice = 1 << iota
+	rwWrite
+	rwOff rwChoice = 0
+)
+
+// Examples for the options
+var rwExamples = fs.OptionExamples{{
+	Value: rwOff.String(),
+	Help:  "Do not read or write the value",
+}, {
+	Value: rwRead.String(),
+	Help:  "Read the value only",
+}, {
+	Value: rwWrite.String(),
+	Help:  "Write the value only",
+}, {
+	Value: (rwRead | rwWrite).String(),
+	Help:  "Read and Write the value.",
+}}
+
 // Parse the scopes option returning a slice of scopes
 func driveScopes(scopesString string) (scopes []string) {
 	if scopesString == "" {
@@ -649,6 +684,7 @@ type Options struct {
 	UseTrash                  bool                 `config:"use_trash"`
 	CopyShortcutContent       bool                 `config:"copy_shortcut_content"`
 	SkipGdocs                 bool                 `config:"skip_gdocs"`
+	ShowAllGdocs              bool                 `config:"show_all_gdocs"`
 	SkipChecksumGphotos       bool                 `config:"skip_checksum_gphotos"`
 	SharedWithMe              bool                 `config:"shared_with_me"`
 	TrashedOnly               bool                 `config:"trashed_only"`
@@ -676,6 +712,10 @@ type Options struct {
 	SkipShortcuts             bool                 `config:"skip_shortcuts"`
 	SkipDanglingShortcuts     bool                 `config:"skip_dangling_shortcuts"`
 	ResourceKey               string               `config:"resource_key"`
+	FastListBugFix            bool                 `config:"fast_list_bug_fix"`
+	MetadataOwner             rwChoice             `config:"metadata_owner"`
+	MetadataPermissions       rwChoice             `config:"metadata_permissions"`
+	MetadataLabels            rwChoice             `config:"metadata_labels"`
 	Enc                       encoder.MultiEncoder `config:"encoding"`
 	EnvAuth                   bool                 `config:"env_auth"`
 }
@@ -699,9 +739,11 @@ type Fs struct {
 	isTeamDrive      bool               // true if this is a team drive
 	fileFields       googleapi.Field    // fields to fetch file info with
 	m                configmap.Mapper
-	grouping         int32               // number of IDs to search at once in ListR - read with atomic
-	listRmu          *sync.Mutex         // protects listRempties
-	listRempties     map[string]struct{} // IDs of supposedly empty directories which triggered grouping disable
+	grouping         int32                        // number of IDs to search at once in ListR - read with atomic
+	listRmu          *sync.Mutex                  // protects listRempties
+	listRempties     map[string]struct{}          // IDs of supposedly empty directories which triggered grouping disable
+	permissionsMu    *sync.Mutex                  // protect the below
+	permissions      map[string]*drive.Permission // map permission IDs to Permissions
 
 	ServiceAccountFiles map[string]int
 	serviceAccountMutex sync.Mutex          // Mod
@@ -741,6 +783,8 @@ type Object struct {
 	baseObject
 	url        string // Download URL of this object
 	md5sum     string // md5sum of the object
+	sha1sum    string // sha1sum of the object
+	sha256sum  string // sha256sum of the object
 	v2Download bool   // generate v2 download link ondemand
 }
 
@@ -1538,7 +1582,7 @@ func newFs(ctx context.Context, name, path string, m configmap.Mapper) (*Fs, err
 		uploadHelperTDPool: tdpool,
 	}
 	f.isTeamDrive = opt.TeamDriveID != ""
-	f.fileFields = f.getFileFields()
+	f.fileFields = f.getFileFields(ctx)
 	f.features = (&fs.Features{
 		DuplicateFiles:           true,
 		ReadMimeType:             true,
@@ -1716,7 +1760,7 @@ func NewFs(ctx context.Context, name, path string, m configmap.Mapper) (fs.Fs, e
 	return f, nil
 }
 
-func (f *Fs) newBaseObject(remote string, info *drive.File) baseObject {
+func (f *Fs) newBaseObject(ctx context.Context, remote string, info *drive.File) (o baseObject, err error) {
 	modifiedDate := info.ModifiedTime
 	if f.opt.UseCreatedDate {
 		modifiedDate = info.CreatedTime
@@ -1727,7 +1771,7 @@ func (f *Fs) newBaseObject(remote string, info *drive.File) baseObject {
 	if f.opt.SizeAsQuota {
 		size = info.QuotaBytesUsed
 	}
-	return baseObject{
+	o = baseObject{
 		fs:           f,
 		remote:       remote,
 		id:           info.Id,
@@ -1736,10 +1780,45 @@ func (f *Fs) newBaseObject(remote string, info *drive.File) baseObject {
 		bytes:        size,
 		parents:      info.Parents,
 	}
+	err = nil
+	if fs.GetConfig(ctx).Metadata {
+		err = o.parseMetadata(ctx, info)
+	}
+	return o, err
+}
+
+// newRegularObject creates an fs.Object for a normal drive.File
+func (f *Fs) newRegularObject(ctx context.Context, remote string, info *drive.File) (obj fs.Object, err error) {
+	// wipe checksum if SkipChecksumGphotos and file is type Photo or Video
+	if f.opt.SkipChecksumGphotos {
+		for _, space := range info.Spaces {
+			if space == "photos" {
+				info.Md5Checksum = ""
+				info.Sha1Checksum = ""
+				info.Sha256Checksum = ""
+				break
+			}
+		}
+	}
+	o := &Object{
+		url:        fmt.Sprintf("%sfiles/%s?alt=media", f.svc.BasePath, actualID(info.Id)),
+		md5sum:     strings.ToLower(info.Md5Checksum),
+		sha1sum:    strings.ToLower(info.Sha1Checksum),
+		sha256sum:  strings.ToLower(info.Sha256Checksum),
+		v2Download: f.opt.V2DownloadMinSize != -1 && info.Size >= int64(f.opt.V2DownloadMinSize),
+	}
+	o.baseObject, err = f.newBaseObject(ctx, remote, info)
+	if err != nil {
+		return nil, err
+	}
+	if info.ResourceKey != "" {
+		o.resourceKey = &info.ResourceKey
+	}
+	return o, nil
 }
 
 // getFileFields gets the fields for a normal file Get or List
-func (f *Fs) getFileFields() (fields googleapi.Field) {
+func (f *Fs) getFileFields(ctx context.Context) (fields googleapi.Field) {
 	fields = partialFields
 	if f.opt.AuthOwnerOnly {
 		fields += ",owners"
@@ -1756,37 +1835,17 @@ func (f *Fs) getFileFields() (fields googleapi.Field) {
 	return fields
 }
 
-// newRegularObject creates an fs.Object for a normal drive.File
-func (f *Fs) newRegularObject(remote string, info *drive.File) fs.Object {
-	// wipe checksum if SkipChecksumGphotos and file is type Photo or Video
-	if f.opt.SkipChecksumGphotos {
-		for _, space := range info.Spaces {
-			if space == "photos" {
-				info.Md5Checksum = ""
-				break
-			}
-		}
-	}
-	o := &Object{
-		baseObject: f.newBaseObject(remote, info),
-		url:        fmt.Sprintf("%sfiles/%s?alt=media", f.svc.BasePath, actualID(info.Id)),
-		md5sum:     strings.ToLower(info.Md5Checksum),
-		v2Download: f.opt.V2DownloadMinSize != -1 && info.Size >= int64(f.opt.V2DownloadMinSize),
-	}
-	if info.ResourceKey != "" {
-		o.resourceKey = &info.ResourceKey
-	}
-	return o
-}
-
 // newDocumentObject creates an fs.Object for a google docs drive.File
-func (f *Fs) newDocumentObject(remote string, info *drive.File, extension, exportMimeType string) (fs.Object, error) {
+func (f *Fs) newDocumentObject(ctx context.Context, remote string, info *drive.File, extension, exportMimeType string) (fs.Object, error) {
 	mediaType, _, err := mime.ParseMediaType(exportMimeType)
 	if err != nil {
 		return nil, err
 	}
 	url := info.ExportLinks[mediaType]
-	baseObject := f.newBaseObject(remote+extension, info)
+	baseObject, err := f.newBaseObject(ctx, remote+extension, info)
+	if err != nil {
+		return nil, err
+	}
 	baseObject.bytes = -1
 	baseObject.mimeType = exportMimeType
 	return &documentObject{
@@ -1798,7 +1857,7 @@ func (f *Fs) newDocumentObject(remote string, info *drive.File, extension, expor
 }
 
 // newLinkObject creates an fs.Object that represents a link a google docs drive.File
-func (f *Fs) newLinkObject(remote string, info *drive.File, extension, exportMimeType string) (fs.Object, error) {
+func (f *Fs) newLinkObject(ctx context.Context, remote string, info *drive.File, extension, exportMimeType string) (fs.Object, error) {
 	t := linkTemplate(exportMimeType)
 	if t == nil {
 		return nil, fmt.Errorf("unsupported link type %s", exportMimeType)
@@ -1817,7 +1876,10 @@ func (f *Fs) newLinkObject(remote string, info *drive.File, extension, exportMim
 		return nil, fmt.Errorf("executing template failed: %w", err)
 	}
 
-	baseObject := f.newBaseObject(remote+extension, info)
+	baseObject, err := f.newBaseObject(ctx, remote+extension, info)
+	if err != nil {
+		return nil, err
+	}
 	baseObject.bytes = int64(buf.Len())
 	baseObject.mimeType = exportMimeType
 	return &linkObject{
@@ -1833,7 +1895,7 @@ func (f *Fs) newLinkObject(remote string, info *drive.File, extension, exportMim
 func (f *Fs) newObjectWithInfo(ctx context.Context, remote string, info *drive.File) (fs.Object, error) {
 	// If item has MD5 sum it is a file stored on drive
 	if info.Md5Checksum != "" {
-		return f.newRegularObject(remote, info), nil
+		return f.newRegularObject(ctx, remote, info)
 	}
 
 	extension, exportName, exportMimeType, isDocument := f.findExportFormat(ctx, info)
@@ -1864,13 +1926,15 @@ func (f *Fs) newObjectWithExportInfo(
 	case info.MimeType == shortcutMimeTypeDangling:
 		// Pretend a dangling shortcut is a regular object
 		// It will error if used, but appear in listings so it can be deleted
-		return f.newRegularObject(remote, info), nil
+		return f.newRegularObject(ctx, remote, info)
 	case info.Md5Checksum != "":
 		// If item has MD5 sum it is a file stored on drive
-		return f.newRegularObject(remote, info), nil
+		return f.newRegularObject(ctx, remote, info)
 	case f.opt.SkipGdocs:
 		fs.Debugf(remote, "Skipping google document type %q", info.MimeType)
 		return nil, fs.ErrorObjectNotFound
+	case f.opt.ShowAllGdocs:
+		return f.newDocumentObject(ctx, remote, info, "", info.MimeType)
 	default:
 		// If item MimeType is in the ExportFormats then it is a google doc
 		if !isDocument {
@@ -1882,9 +1946,9 @@ func (f *Fs) newObjectWithExportInfo(
 			return nil, fs.ErrorObjectNotFound
 		}
 		if isLinkMimeType(exportMimeType) {
-			return f.newLinkObject(remote, info, extension, exportMimeType)
+			return f.newLinkObject(ctx, remote, info, extension, exportMimeType)
 		}
-		return f.newDocumentObject(remote, info, extension, exportMimeType)
+		return f.newDocumentObject(ctx, remote, info, extension, exportMimeType)
 	}
 }
 
@@ -1964,7 +2028,7 @@ func (f *Fs) createDir(ctx context.Context, pathID, leaf string, metadata fs.Met
 		if s, _ := f.serviceAccountPool.GetService(); err == nil && s != nil {
 			svc = s
 		}
-		info, err = f.svc.Files.Create(createInfo).
+		info, err = svc.Files.Create(createInfo).
 			Fields(f.getFileFields(ctx)).
 			SupportsAllDrives(true).
 			Context(ctx).Do()
