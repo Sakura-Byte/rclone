@@ -394,12 +394,6 @@ func (f *Fs) sampleUploadForm(ctx context.Context, in io.Reader, initResp *api.S
 			}
 		}()
 
-		defer func ()  {
-			if err := multipartWriter.Close(); err != nil {
-				errChan <- fmt.Errorf("failed to close multipart writer: %w", err)
-			}
-		}
-
 		// Add normal form fields
 		fields := map[string]string{
 			"name":                  name,
