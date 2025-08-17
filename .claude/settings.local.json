@@ -2,7 +2,11 @@
   "permissions": {
     "allow": [
       "Bash(grep:*)",
-      "Bash(rclone help:*)"
+      "Bash(rclone help:*)",
+      "Bash(go run:*)",
+      "Bash(go test:*)",
+      "Bash(mv:*)",
+      "Bash(rm:*)"
     ],
     "deny": []
   }

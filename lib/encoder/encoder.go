@@ -1264,5 +1264,129 @@ func ToStandardName(e Encoder, s string) string {
 	if e == Standard {
 		return s
 	}
+	
+	// Special handling: when converting to Standard encoding, we need to avoid
+	// quoting characters that are legitimate in the source encoding.
+	// The key insight: decode with source, then encode ONLY the characters
+	// that are actually filesystem-unsafe, not characters that look encoded.
+	if mask, ok := e.(MultiEncoder); ok {
+		return encodeToStandardFromMask(mask, s)
+	}
+	
 	return Standard.Encode(e.Decode(s))
+}
+
+// encodeToStandardFromMask properly converts from any source encoding to Standard
+// by first decoding the source, then applying only the necessary Standard rules
+// without the quoting behavior for characters that are legitimate in the source.
+func encodeToStandardFromMask(sourceMask MultiEncoder, s string) string {
+	if s == "" {
+		return ""
+	}
+	
+	// First, decode the string according to the source encoding
+	decoded := sourceMask.Decode(s)
+	
+	// Now we need to apply Standard encoding, but we must be careful:
+	// - Characters that the source encoding handles should NOT be quoted
+	// - Only characters that are truly filesystem-unsafe should be encoded
+	
+	// The solution: apply Standard encoding rules selectively
+	return encodeForStandardSelective(sourceMask, decoded)
+}
+
+// encodeForStandardSelective applies Standard encoding rules but avoids
+// quoting characters that are legitimate in the source encoding
+func encodeForStandardSelective(sourceMask MultiEncoder, s string) string {
+	if s == "" {
+		return ""
+	}
+	
+	// Handle special dot cases (always needed for Standard)
+	switch s {
+	case ".":
+		return "．"
+	case "..":
+		return "．．"
+	}
+	
+	var out strings.Builder
+	out.Grow(len(s))
+	
+	for _, r := range s {
+		switch r {
+		case 0:
+			// Always encode null (part of Standard)
+			out.WriteRune('␀') // SYMBOL FOR NULL
+		case '/':
+			// Always encode slash to fullwidth (part of Standard)
+			out.WriteRune('／') // FULLWIDTH SOLIDUS
+		case 0x7F:
+			// Always encode DEL if Standard includes it
+			if Standard.Has(EncodeDel) {
+				out.WriteRune('␡') // SYMBOL FOR DELETE
+			} else {
+				out.WriteRune(r)
+			}
+		case '／': // FULLWIDTH SOLIDUS
+			// This is the key fix: only quote if source encoding includes EncodeSlash
+			if sourceMask.Has(EncodeSlash) {
+				// Source handles slash encoding, so this ／ represents an encoded /
+				// and should be quoted in Standard form
+				out.WriteRune(QuoteRune)
+				out.WriteRune(r)
+			} else {
+				// Source doesn't handle slash encoding, so this ／ is a legitimate character
+				out.WriteRune(r)
+			}
+		default:
+			// Handle control characters
+			if r >= 1 && r <= 0x1F && Standard.Has(EncodeCtl) {
+				out.WriteRune('␀' + r) // SYMBOL FOR NULL + offset
+			} else {
+				// For other characters, check if they need quoting based on source encoding
+				needsQuoting := false
+				
+				// Check various encoding rules and quote only if source handles them
+				if r == '＜' || r == '＞' { // FULLWIDTH < >
+					needsQuoting = sourceMask.Has(EncodeLtGt)
+				} else if r == '＂' { // FULLWIDTH "
+					needsQuoting = sourceMask.Has(EncodeDoubleQuote)
+				} else if r == '＇' { // FULLWIDTH '
+					needsQuoting = sourceMask.Has(EncodeSingleQuote)
+				} else if r == '｀' { // FULLWIDTH `
+					needsQuoting = sourceMask.Has(EncodeBackQuote)
+				} else if r == '＄' { // FULLWIDTH $
+					needsQuoting = sourceMask.Has(EncodeDollar)
+				} else if r == '：' { // FULLWIDTH :
+					needsQuoting = sourceMask.Has(EncodeColon)
+				} else if r == '？' { // FULLWIDTH ?
+					needsQuoting = sourceMask.Has(EncodeQuestion)
+				} else if r == '＊' { // FULLWIDTH *
+					needsQuoting = sourceMask.Has(EncodeAsterisk)
+				} else if r == '｜' { // FULLWIDTH |
+					needsQuoting = sourceMask.Has(EncodePipe)
+				} else if r == '＃' { // FULLWIDTH #
+					needsQuoting = sourceMask.Has(EncodeHash)
+				} else if r == '％' { // FULLWIDTH %
+					needsQuoting = sourceMask.Has(EncodePercent)
+				} else if r == '＼' { // FULLWIDTH \
+					needsQuoting = sourceMask.Has(EncodeBackSlash)
+				} else if r == '［' || r == '］' { // FULLWIDTH [ ]
+					needsQuoting = sourceMask.Has(EncodeSquareBracket)
+				} else if r == '；' { // FULLWIDTH ;
+					needsQuoting = sourceMask.Has(EncodeSemicolon)
+				} else if r == '！' { // FULLWIDTH !
+					needsQuoting = sourceMask.Has(EncodeExclamation)
+				}
+				
+				if needsQuoting {
+					out.WriteRune(QuoteRune)
+				}
+				out.WriteRune(r)
+			}
+		}
+	}
+	
+	return out.String()
 }
