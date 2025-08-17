@@ -11,11 +11,15 @@ require (
 	github.com/Azure/go-ntlmssp v0.0.0-20221128193559-754e69321358
 	github.com/Files-com/files-sdk-go/v3 v3.2.173
 	github.com/Max-Sum/base32768 v0.0.0-20230304063302-18e6ce5945fd
+	github.com/Sakura-Byte/go-mega v0.0.0-20250419044022-6bded2a233e8
 	github.com/a8m/tree v0.0.0-20240104212747-2c8764a5f17e
 	github.com/aalpar/deheap v0.0.0-20210914013432-0cc84d79dec3
 	github.com/abbot/go-http-auth v0.4.0
+	github.com/aead/ecdh v0.2.0
+	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.2.3
 	github.com/anacrolix/dms v1.7.1
 	github.com/anacrolix/log v0.16.0
+	github.com/andreburgaud/crypt2go v1.8.0
 	github.com/atotto/clipboard v0.1.4
 	github.com/aws/aws-sdk-go-v2 v1.36.3
 	github.com/aws/aws-sdk-go-v2/config v1.29.14
@@ -24,6 +28,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.80.0
 	github.com/aws/smithy-go v1.22.3
 	github.com/buengese/sgzip v0.1.1
+	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/cloudinary/cloudinary-go/v2 v2.10.0
 	github.com/cloudsoda/go-smb2 v0.0.0-20250228001242-d4c70e6251cc
 	github.com/colinmarc/hdfs/v2 v2.4.0
@@ -56,6 +61,7 @@ require (
 	github.com/ncw/swift/v2 v2.0.4
 	github.com/oracle/oci-go-sdk/v65 v65.93.0
 	github.com/patrickmn/go-cache v2.1.0+incompatible
+	github.com/pierrec/lz4/v4 v4.1.18
 	github.com/pkg/sftp v1.13.9
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2
 	github.com/prometheus/client_golang v1.22.0
@@ -70,7 +76,6 @@ require (
 	github.com/spf13/cobra v1.9.1
 	github.com/spf13/pflag v1.0.6
 	github.com/stretchr/testify v1.10.0
-	github.com/t3rm1n4l/go-mega v0.0.0-20241213151442-a19cff0ec7b5
 	github.com/unknwon/goconfig v1.0.0
 	github.com/willscott/go-nfs v0.0.3
 	github.com/winfsp/cgofuse v1.6.0
