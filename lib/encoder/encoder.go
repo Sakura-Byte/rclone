@@ -1265,127 +1265,114 @@ func ToStandardName(e Encoder, s string) string {
 		return s
 	}
 	
-	// Special handling: when converting to Standard encoding, we need to avoid
-	// quoting characters that are legitimate in the source encoding.
-	// The key insight: decode with source, then encode ONLY the characters
-	// that are actually filesystem-unsafe, not characters that look encoded.
+	// If the source is a MultiEncoder, we need context-aware conversion
+	// to avoid quoting legitimate Unicode characters
 	if mask, ok := e.(MultiEncoder); ok {
-		return encodeToStandardFromMask(mask, s)
+		return convertToStandard(s, mask)
 	}
 	
 	return Standard.Encode(e.Decode(s))
 }
 
-// encodeToStandardFromMask properly converts from any source encoding to Standard
-// by first decoding the source, then applying only the necessary Standard rules
-// without the quoting behavior for characters that are legitimate in the source.
-func encodeToStandardFromMask(sourceMask MultiEncoder, s string) string {
-	if s == "" {
-		return ""
-	}
-	
-	// First, decode the string according to the source encoding
+// convertToStandard converts a string from source encoding to Standard encoding
+// while preserving legitimate Unicode characters that aren't encoded forms
+func convertToStandard(s string, sourceMask MultiEncoder) string {
+	// First decode according to source
 	decoded := sourceMask.Decode(s)
 	
-	// Now we need to apply Standard encoding, but we must be careful:
-	// - Characters that the source encoding handles should NOT be quoted
-	// - Only characters that are truly filesystem-unsafe should be encoded
-	
-	// The solution: apply Standard encoding rules selectively
-	return encodeForStandardSelective(sourceMask, decoded)
+	// Then apply Standard encoding, but be aware of what the source handles
+	// to avoid quoting legitimate Unicode characters
+	return applyStandardWithContext(decoded, sourceMask)
 }
 
-// encodeForStandardSelective applies Standard encoding rules but avoids
-// quoting characters that are legitimate in the source encoding
-func encodeForStandardSelective(sourceMask MultiEncoder, s string) string {
+// applyStandardWithContext applies Standard encoding rules but only quotes
+// fullwidth characters if they represent encoded forms (i.e., the source
+// encoding handles that character type)
+func applyStandardWithContext(s string, sourceMask MultiEncoder) string {
 	if s == "" {
 		return ""
 	}
 	
-	// Handle special dot cases (always needed for Standard)
-	switch s {
-	case ".":
-		return "．"
-	case "..":
-		return "．．"
+	// Handle special dot cases
+	if Standard.Has(EncodeDot) {
+		switch s {
+		case ".":
+			return "．"
+		case "..":
+			return "．．"
+		}
 	}
 	
 	var out strings.Builder
 	out.Grow(len(s))
 	
 	for _, r := range s {
+		// Handle characters that Standard always encodes
 		switch r {
 		case 0:
-			// Always encode null (part of Standard)
-			out.WriteRune('␀') // SYMBOL FOR NULL
+			if Standard.Has(EncodeZero) {
+				out.WriteRune('␀')
+				continue
+			}
 		case '/':
-			// Always encode slash to fullwidth (part of Standard)
-			out.WriteRune('／') // FULLWIDTH SOLIDUS
+			if Standard.Has(EncodeSlash) {
+				out.WriteRune('／')
+				continue
+			}
 		case 0x7F:
-			// Always encode DEL if Standard includes it
 			if Standard.Has(EncodeDel) {
-				out.WriteRune('␡') // SYMBOL FOR DELETE
-			} else {
-				out.WriteRune(r)
-			}
-		case '／': // FULLWIDTH SOLIDUS
-			// This is the key fix: only quote if source encoding includes EncodeSlash
-			if sourceMask.Has(EncodeSlash) {
-				// Source handles slash encoding, so this ／ represents an encoded /
-				// and should be quoted in Standard form
-				out.WriteRune(QuoteRune)
-				out.WriteRune(r)
-			} else {
-				// Source doesn't handle slash encoding, so this ／ is a legitimate character
-				out.WriteRune(r)
-			}
-		default:
-			// Handle control characters
-			if r >= 1 && r <= 0x1F && Standard.Has(EncodeCtl) {
-				out.WriteRune('␀' + r) // SYMBOL FOR NULL + offset
-			} else {
-				// For other characters, check if they need quoting based on source encoding
-				needsQuoting := false
-				
-				// Check various encoding rules and quote only if source handles them
-				if r == '＜' || r == '＞' { // FULLWIDTH < >
-					needsQuoting = sourceMask.Has(EncodeLtGt)
-				} else if r == '＂' { // FULLWIDTH "
-					needsQuoting = sourceMask.Has(EncodeDoubleQuote)
-				} else if r == '＇' { // FULLWIDTH '
-					needsQuoting = sourceMask.Has(EncodeSingleQuote)
-				} else if r == '｀' { // FULLWIDTH `
-					needsQuoting = sourceMask.Has(EncodeBackQuote)
-				} else if r == '＄' { // FULLWIDTH $
-					needsQuoting = sourceMask.Has(EncodeDollar)
-				} else if r == '：' { // FULLWIDTH :
-					needsQuoting = sourceMask.Has(EncodeColon)
-				} else if r == '？' { // FULLWIDTH ?
-					needsQuoting = sourceMask.Has(EncodeQuestion)
-				} else if r == '＊' { // FULLWIDTH *
-					needsQuoting = sourceMask.Has(EncodeAsterisk)
-				} else if r == '｜' { // FULLWIDTH |
-					needsQuoting = sourceMask.Has(EncodePipe)
-				} else if r == '＃' { // FULLWIDTH #
-					needsQuoting = sourceMask.Has(EncodeHash)
-				} else if r == '％' { // FULLWIDTH %
-					needsQuoting = sourceMask.Has(EncodePercent)
-				} else if r == '＼' { // FULLWIDTH \
-					needsQuoting = sourceMask.Has(EncodeBackSlash)
-				} else if r == '［' || r == '］' { // FULLWIDTH [ ]
-					needsQuoting = sourceMask.Has(EncodeSquareBracket)
-				} else if r == '；' { // FULLWIDTH ;
-					needsQuoting = sourceMask.Has(EncodeSemicolon)
-				} else if r == '！' { // FULLWIDTH !
-					needsQuoting = sourceMask.Has(EncodeExclamation)
-				}
-				
-				if needsQuoting {
-					out.WriteRune(QuoteRune)
-				}
-				out.WriteRune(r)
+				out.WriteRune('␡')
+				continue
 			}
 		}
+		
+		// Handle control characters
+		if r >= 1 && r <= 0x1F && Standard.Has(EncodeCtl) {
+			out.WriteRune('␀' + r)
+			continue
+		}
+		
+		// Handle fullwidth characters - only quote if source handles that type
+		needsQuoting := false
+		switch r {
+		case '／':
+			needsQuoting = sourceMask.Has(EncodeSlash)
+		case '＜', '＞':
+			needsQuoting = sourceMask.Has(EncodeLtGt)
+		case '＂':
+			needsQuoting = sourceMask.Has(EncodeDoubleQuote)
+		case '＇':
+			needsQuoting = sourceMask.Has(EncodeSingleQuote)
+		case '｀':
+			needsQuoting = sourceMask.Has(EncodeBackQuote)
+		case '＄':
+			needsQuoting = sourceMask.Has(EncodeDollar)
+		case '：':
+			needsQuoting = sourceMask.Has(EncodeColon)
+		case '？':
+			needsQuoting = sourceMask.Has(EncodeQuestion)
+		case '＊':
+			needsQuoting = sourceMask.Has(EncodeAsterisk)
+		case '｜':
+			needsQuoting = sourceMask.Has(EncodePipe)
+		case '＃':
+			needsQuoting = sourceMask.Has(EncodeHash)
+		case '％':
+			needsQuoting = sourceMask.Has(EncodePercent)
+		case '＼':
+			needsQuoting = sourceMask.Has(EncodeBackSlash)
+		case '［', '］':
+			needsQuoting = sourceMask.Has(EncodeSquareBracket)
+		case '；':
+			needsQuoting = sourceMask.Has(EncodeSemicolon)
+		case '！':
+			needsQuoting = sourceMask.Has(EncodeExclamation)
+		}
+		
+		if needsQuoting {
+			out.WriteRune(QuoteRune)
+		}
+		out.WriteRune(r)
 	}
 	
 	return out.String()
