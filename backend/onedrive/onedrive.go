@@ -574,8 +574,20 @@ func makeOauthConfig(ctx context.Context, opt *Options) (*oauthutil.Config, erro
 	if opt.Tenant != "" {
 		prefix = "/" + opt.Tenant
 	}
-	oauthConfig.TokenURL = authEndpoint[opt.Region] + prefix + tokenPath
-	oauthConfig.AuthURL = authEndpoint[opt.Region] + prefix + authPath
+	
+	// Use the region, defaulting to "global" if empty or not found
+	region := opt.Region
+	if region == "" {
+		region = regionGlobal
+	}
+	endpoint, found := authEndpoint[region]
+	if !found {
+		region = regionGlobal
+		endpoint = authEndpoint[region]
+	}
+	
+	oauthConfig.TokenURL = endpoint + prefix + tokenPath
+	oauthConfig.AuthURL = endpoint + prefix + authPath
 
 	// Check to see if we are using client credentials flow
 	if opt.ClientCredentials {

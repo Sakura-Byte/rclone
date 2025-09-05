@@ -12,7 +12,9 @@
       "Bash(go build:*)",
       "Bash(./rclone.exe --config \"D:\\Tech\\rclone\\rclone.conf\" about acgdb5asmrrec:)",
       "Bash(./rclone.exe --config \"D:\\Tech\\rclone\\rclone.conf\" ls acgdb5asmrrec: --max-depth 1)",
-      "Bash(./rclone.exe --config \"D:\\Tech\\rclone\\rclone.conf\" version)"
+      "Bash(./rclone.exe --config \"D:\\Tech\\rclone\\rclone.conf\" version)",
+      "Bash(rg:*)",
+      "Bash(rclone config:*)"
     ],
     "deny": []
   }
