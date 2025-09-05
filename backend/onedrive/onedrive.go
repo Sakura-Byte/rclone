@@ -1080,6 +1080,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, errors.New("unable to get drive_id and drive_type - if you are upgrading from older versions of rclone, please run `rclone config` and re-configure this backend")
 	}
 
+	// Default region to "global" if empty to match makeOauthConfig behavior
+	if opt.Region == "" {
+		opt.Region = regionGlobal
+	}
+
 	rootURL := graphAPIEndpoint[opt.Region] + "/v1.0" + "/drives/" + opt.DriveID
 
 	oauthConfig, err := makeOauthConfig(ctx, opt)
