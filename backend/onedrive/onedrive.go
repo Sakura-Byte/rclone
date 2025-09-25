@@ -56,6 +56,7 @@ const (
 	driveTypeSharepoint         = "documentLibrary"
 	defaultChunkSize            = 10 * fs.Mebi
 	chunkSizeMultiple           = 320 * fs.Kibi
+	maxSinglePartSize           = 4 * fs.Mebi
 
 	regionGlobal = "global"
 	regionUS     = "us"
@@ -138,6 +139,21 @@ func init() {
 					Help:  "Azure and Office 365 operated by Vnet Group in China",
 				},
 			},
+		}, {
+			Name: "upload_cutoff",
+			Help: `Cutoff for switching to chunked upload.
+
+Any files larger than this will be uploaded in chunks of chunk_size.
+
+This is disabled by default as uploading using single part uploads
+causes rclone to use twice the storage on Onedrive business as when
+rclone sets the modification time after the upload Onedrive creates a
+new version.
+
+See: https://github.com/rclone/rclone/issues/1716
+`,
+			Default:  fs.SizeSuffix(-1),
+			Advanced: true,
 		}, {
 			Name: "chunk_size",
 			Help: `Chunk size to upload files with - must be multiple of 320k (327,680 bytes).
@@ -558,8 +574,20 @@ func makeOauthConfig(ctx context.Context, opt *Options) (*oauthutil.Config, erro
 	if opt.Tenant != "" {
 		prefix = "/" + opt.Tenant
 	}
-	oauthConfig.TokenURL = authEndpoint[opt.Region] + prefix + tokenPath
-	oauthConfig.AuthURL = authEndpoint[opt.Region] + prefix + authPath
+	
+	// Use the region, defaulting to "global" if empty or not found
+	region := opt.Region
+	if region == "" {
+		region = regionGlobal
+	}
+	endpoint, found := authEndpoint[region]
+	if !found {
+		region = regionGlobal
+		endpoint = authEndpoint[region]
+	}
+	
+	oauthConfig.TokenURL = endpoint + prefix + tokenPath
+	oauthConfig.AuthURL = endpoint + prefix + authPath
 
 	// Check to see if we are using client credentials flow
 	if opt.ClientCredentials {
@@ -746,6 +774,7 @@ Examples:
 // Options defines the configuration for this backend
 type Options struct {
 	Region                  string               `config:"region"`
+	UploadCutoff            fs.SizeSuffix        `config:"upload_cutoff"`
 	ChunkSize               fs.SizeSuffix        `config:"chunk_size"`
 	DriveID                 string               `config:"drive_id"`
 	DriveType               string               `config:"drive_type"`
@@ -1022,6 +1051,13 @@ func (f *Fs) setUploadChunkSize(cs fs.SizeSuffix) (old fs.SizeSuffix, err error)
 	return
 }
 
+func checkUploadCutoff(cs fs.SizeSuffix) error {
+	if cs > maxSinglePartSize {
+		return fmt.Errorf("%v is greater than %v", cs, maxSinglePartSize)
+	}
+	return nil
+}
+
 // NewFs constructs an Fs from the path, container:path
 func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, error) {
 	// Parse config into Options struct
@@ -1035,9 +1071,18 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, fmt.Errorf("onedrive: chunk size: %w", err)
 	}
+	err = checkUploadCutoff(opt.UploadCutoff)
+	if err != nil {
+		return nil, fmt.Errorf("onedrive: upload cutoff: %w", err)
+	}
 
 	if opt.DriveID == "" || opt.DriveType == "" {
 		return nil, errors.New("unable to get drive_id and drive_type - if you are upgrading from older versions of rclone, please run `rclone config` and re-configure this backend")
+	}
+
+	// Default region to "global" if empty to match makeOauthConfig behavior
+	if opt.Region == "" {
+		opt.Region = regionGlobal
 	}
 
 	rootURL := graphAPIEndpoint[opt.Region] + "/v1.0" + "/drives/" + opt.DriveID
@@ -1754,7 +1799,9 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (dst fs.Obj
 	if err != nil {
 		return nil, err
 	}
-	err = dstObj.setMetaData(info)
+	if info != nil {
+		err = dstObj.setMetaData(info)
+	}
 	return dstObj, err
 }
 
@@ -1834,7 +1881,9 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	if err != nil {
 		return nil, err
 	}
-	err = dstObj.setMetaData(info)
+	if info != nil {
+		err = dstObj.setMetaData(info)
+	}
 	return dstObj, err
 }
 
@@ -2469,6 +2518,10 @@ func (o *Object) uploadFragment(ctx context.Context, url string, start int64, to
 				return false, nil
 			}
 			return true, fmt.Errorf("retry this chunk skipping %d bytes: %w", skip, err)
+		} else if err != nil && resp != nil && resp.StatusCode == http.StatusNotFound {
+			fs.Debugf(o, "Received 404 error: assuming eventual consistency problem with session - retrying chunk: %v", err)
+			time.Sleep(5 * time.Second) // a little delay to help things along
+			return true, err
 		}
 		if err != nil {
 			return shouldRetry(ctx, resp, err)
@@ -2563,8 +2616,8 @@ func (o *Object) uploadMultipart(ctx context.Context, in io.Reader, src fs.Objec
 // This function will set modtime and metadata after uploading, which will create a new version for the remote file
 func (o *Object) uploadSinglepart(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (info *api.Item, err error) {
 	size := src.Size()
-	if size < 0 || size > int64(fs.SizeSuffix(4*1024*1024)) {
-		return nil, errors.New("size passed into uploadSinglepart must be >= 0 and <= 4 MiB")
+	if size < 0 || size > int64(maxSinglePartSize) {
+		return nil, fmt.Errorf("size passed into uploadSinglepart must be >= 0 and <= %v", maxSinglePartSize)
 	}
 
 	fs.Debugf(o, "Starting singlepart upload")
@@ -2597,7 +2650,10 @@ func (o *Object) uploadSinglepart(ctx context.Context, in io.Reader, src fs.Obje
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch and update metadata: %w", err)
 	}
-	return info, o.setMetaData(info)
+	if info != nil {
+		err = o.setMetaData(info)
+	}
+	return info, err
 }
 
 // Update the object with the contents of the io.Reader, modTime and size
@@ -2617,9 +2673,9 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	size := src.Size()
 
 	var info *api.Item
-	if size > 0 {
+	if size > 0 && size >= int64(o.fs.opt.UploadCutoff) {
 		info, err = o.uploadMultipart(ctx, in, src, options...)
-	} else if size == 0 {
+	} else if size >= 0 {
 		info, err = o.uploadSinglepart(ctx, in, src, options...)
 	} else {
 		return errors.New("unknown-sized upload not supported")

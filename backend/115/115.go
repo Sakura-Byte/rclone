@@ -1639,7 +1639,8 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 func (f *Fs) FindLeaf(ctx context.Context, pathID, leaf string) (foundID string, found bool, err error) {
 	// Use listAll which now uses OpenAPI
 	found, err = f.listAll(ctx, pathID, f.opt.ListChunk, false, false, func(item *api.File) bool {
-		if item.FileNameBest() == leaf {
+		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
+		if decodedName == leaf {
 			foundID = item.ID()
 			// Cache the found item's path/ID mapping
 			parentPath, ok := f.dirCache.GetInv(pathID)
@@ -1694,7 +1695,8 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 	}
 	var iErr error
 	_, err = f.listAll(ctx, dirID, f.opt.ListChunk, false, false, func(item *api.File) bool {
-		entry, err := f.itemToDirEntry(ctx, path.Join(dir, item.FileNameBest()), item)
+		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
+		entry, err := f.itemToDirEntry(ctx, path.Join(dir, decodedName), item)
 		if err != nil {
 			iErr = err // Capture error but continue listing
 			return false
@@ -2159,7 +2161,8 @@ func (f *Fs) purgeCheck(ctx context.Context, dir string, check bool) error {
 	if check {
 		// Check if directory is empty using listAll with limit 1
 		found, listErr := f.listAll(ctx, dirID, 1, false, false, func(item *api.File) bool {
-			fs.Debugf(f, "Rmdir check: directory %q contains %q", dir, item.FileNameBest())
+			decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
+			fs.Debugf(f, "Rmdir check: directory %q contains %q", dir, decodedName)
 			return true // Found an item, stop listing
 		})
 		if listErr != nil {
@@ -2273,7 +2276,8 @@ func (f *Fs) readMetaDataForPath(ctx context.Context, path string) (info *api.Fi
 
 	// List the directory and find the leaf
 	found, err := f.listAll(ctx, dirID, f.opt.ListChunk, true, false, func(item *api.File) bool {
-		if item.FileNameBest() == leaf {
+		decodedName := f.opt.Enc.ToStandardName(item.FileNameBest())
+		if decodedName == leaf {
 			info = item
 			return true // Found it
 		}

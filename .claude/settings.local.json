@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep:*)",
+      "Bash(rclone help:*)",
+      "Bash(go run:*)",
+      "Bash(go test:*)",
+      "Bash(mv:*)",
+      "Bash(rm:*)",
+      "Bash(find:*)",
+      "Bash(git checkout:*)",
+      "Bash(go build:*)",
+      "Bash(./rclone.exe --config \"D:\\Tech\\rclone\\rclone.conf\" about acgdb5asmrrec:)",
+      "Bash(./rclone.exe --config \"D:\\Tech\\rclone\\rclone.conf\" ls acgdb5asmrrec: --max-depth 1)",
+      "Bash(./rclone.exe --config \"D:\\Tech\\rclone\\rclone.conf\" version)",
+      "Bash(rg:*)",
+      "Bash(rclone config:*)",
+      "Bash(./rclone.exe config show)",
+      "Bash(where rclone)",
+      "Bash(D:Techrclonerclone.exe config show)",
+      "Bash(\"D:\\Tech\\rclone\\rclone.exe\" config show)",
+      "Bash(\"D:\\Tech\\rclone\\rclone.exe\" --config \"D:\\Tech\\rclone\\rclone.conf\" ls acgdb2asmrrec: --max-depth 1)",
+      "Bash(\"D:\\Tech\\rclone\\rclone.exe\" config show acgdb5asmrrec)",
+      "Bash(\"D:\\Tech\\rclone\\rclone.exe\" config show acgdb5asmrrec1 acgdb5asmrrec2 acgdb5asmrrec3)",
+      "Bash(\"D:\\Tech\\rclone\\rclone.exe\" config show acgdb5asmrrec1)",
+      "Bash(\"D:\\Tech\\rclone\\rclone.exe\" config show acgdb5asmrrec2)",
+      "Bash(\"D:\\Tech\\rclone\\rclone.exe\" config show acgdb5asmrrec3)",
+      "Bash(\"D:\\Tech\\rclone\\rclone.exe\" config reconnect acgdb5asmrrec2 --dry-run -vv)"
+    ],
+    "deny": []
+  }
+}
