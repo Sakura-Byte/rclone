@@ -45,7 +45,7 @@ const (
 	passportRootURL    = "https://passportapi.115.com"
 	qrCodeAPIRootURL   = "https://qrcodeapi.115.com"
 	hnQrCodeAPIRootURL = "https://hnqrcodeapi.115.com"     // For confirm step
-	defaultAppID       = "100195123"                       // Provided App ID
+	defaultAppID       = "100195125"                       // Provided App ID
 	tradUserAgent      = "Mozilla/5.0 115Browser/27.0.7.5" // Keep for traditional login mimicry?
 	defaultUserAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36"
 
