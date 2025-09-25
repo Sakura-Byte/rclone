@@ -250,7 +250,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	// Incorporate root_path if provided.
 	if opt.RootPath != "" && opt.RootPath != "/" {
-		root = path.Join(root, opt.RootPath)
+		root = path.Join(opt.RootPath, root)
 	}
 
 	f := &Fs{
