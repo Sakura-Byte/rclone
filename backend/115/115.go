@@ -306,13 +306,15 @@ type Fs struct {
 	m             configmap.Mapper // config map for saving tokens
 
 	// Token management
-	tokenMu      sync.Mutex
-	accessToken  string
-	refreshToken string
-	tokenExpiry  time.Time
-	codeVerifier string // For PKCE
-	tokenRenewer *oauthutil.Renew
-	loginMu      sync.Mutex
+	tokenMu         sync.Mutex
+	tokenCond       *sync.Cond
+	tokenRefreshing bool
+	accessToken     string
+	refreshToken    string
+	tokenExpiry     time.Time
+	codeVerifier    string // For PKCE
+	tokenRenewer    *oauthutil.Renew
+	loginMu         sync.Mutex
 }
 
 // Object describes a 115 object
@@ -734,47 +736,59 @@ func (f *Fs) exchangeDeviceCodeForToken(ctx context.Context, loginUID string) er
 // refreshTokenIfNecessary refreshes the token if necessary
 func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bool, forceRefresh bool) error {
 	f.tokenMu.Lock()
+	if f.tokenCond == nil {
+		f.tokenCond = sync.NewCond(&f.tokenMu)
+	}
 
-	// Check if token is already valid when we acquire the lock
-	// This handles the case where another thread just refreshed the token
+	for f.tokenRefreshing {
+		prevRefreshToken := f.refreshToken
+		fs.Debugf(f, "Token refresh already in progress, waiting")
+		f.tokenCond.Wait()
+		if f.refreshToken != prevRefreshToken {
+			refreshTokenExpired = false
+			forceRefresh = false
+		}
+		if !forceRefresh && isTokenStillValid(f) {
+			fs.Debugf(f, "Token became valid while waiting for existing refresh")
+			f.tokenMu.Unlock()
+			return nil
+		}
+	}
+
 	if !refreshTokenExpired && !forceRefresh && isTokenStillValid(f) {
 		fs.Debugf(f, "Token is still valid after acquiring lock, skipping refresh")
 		f.tokenMu.Unlock()
 		return nil
 	}
 
-	// Check if we need to perform a full login instead of a refresh
 	if shouldPerformFullLogin(f, refreshTokenExpired) {
 		f.tokenMu.Unlock()
-		err := f.login(ctx) // login handles its own locking
+		err := f.login(ctx)
 		if err != nil {
 			return err
 		}
-		// Save the token after successful login
 		f.saveToken(ctx, f.m)
 		return nil
 	}
 
-	// Check if token is still valid and refresh not forced
-	if !forceRefresh && isTokenStillValid(f) {
-		f.tokenMu.Unlock()
-		return nil
-	}
+	f.tokenRefreshing = true
+	refreshToken := f.refreshToken
+	f.tokenMu.Unlock()
 
-	// Prepare for token refresh
-	refreshToken := f.refreshToken // Make a local copy of the refresh token
-	f.tokenMu.Unlock()             // Unlock before making API call
-
-	// Perform the actual token refresh
 	result, err := f.performTokenRefresh(ctx, refreshToken)
+
+	f.tokenMu.Lock()
+	f.tokenRefreshing = false
+	if err == nil {
+		f.updateTokensLocked(result)
+	}
+	f.tokenCond.Broadcast()
+	f.tokenMu.Unlock()
+
 	if err != nil {
-		return err // Error already formatted with context
+		return err
 	}
 
-	// Update the tokens with new values
-	f.updateTokens(result)
-
-	// Save the refreshed token to config
 	f.saveToken(ctx, f.m)
 
 	return nil
@@ -800,14 +814,6 @@ func shouldPerformFullLogin(f *Fs, refreshTokenExpired bool) bool {
 // isTokenStillValid checks if the current token is still valid
 func isTokenStillValid(f *Fs) bool {
 	return time.Now().Before(f.tokenExpiry.Add(-tokenRefreshWindow))
-}
-
-// prepareForRefresh gets the refresh token and unlocks the mutex
-func (f *Fs) prepareForRefresh() string {
-	fs.Debugf(f, "Access token expired, nearing expiry, or refresh forced. Attempting refresh.")
-	refreshTokenToUse := f.refreshToken
-	f.tokenMu.Unlock() // Unlock before making API call
-	return refreshTokenToUse
 }
 
 // performTokenRefresh handles the actual API call to refresh the token
@@ -932,15 +938,11 @@ func handleRefreshError(f *Fs, ctx context.Context, err error) (*api.RefreshToke
 	return nil, fmt.Errorf("token refresh failed: %w", err)
 }
 
-// updateTokens updates the token values with new values from a refresh response
-func (f *Fs) updateTokens(refreshResp *api.RefreshTokenResp) {
-	// If we got a nil response, it means we did a re-login instead of a refresh
-	if refreshResp == nil {
+// updateTokensLocked updates tokens assuming the caller already holds tokenMu
+func (f *Fs) updateTokensLocked(refreshResp *api.RefreshTokenResp) {
+	if refreshResp == nil || refreshResp.Data == nil {
 		return
 	}
-
-	f.tokenMu.Lock()
-	defer f.tokenMu.Unlock()
 
 	f.accessToken = refreshResp.Data.AccessToken
 	// OpenAPI spec says refresh_token might be updated, so store the new one
@@ -949,6 +951,18 @@ func (f *Fs) updateTokens(refreshResp *api.RefreshTokenResp) {
 	}
 	f.tokenExpiry = time.Now().Add(time.Duration(refreshResp.Data.ExpiresIn) * time.Second)
 	fs.Debugf(f, "Token refreshed successfully, new expiry: %v", f.tokenExpiry)
+}
+
+// updateTokens updates the token values with new values from a refresh response
+func (f *Fs) updateTokens(refreshResp *api.RefreshTokenResp) {
+	if refreshResp == nil {
+		return
+	}
+
+	f.tokenMu.Lock()
+	defer f.tokenMu.Unlock()
+
+	f.updateTokensLocked(refreshResp)
 }
 
 // saveToken saves the current token to the config
@@ -1441,6 +1455,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:          *opt,
 		m:            m,
 	}
+
+	f.tokenCond = sync.NewCond(&f.tokenMu)
 
 	// Initialize features
 	f.features = (&fs.Features{
