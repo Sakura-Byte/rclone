@@ -240,6 +240,9 @@ func (b *OpenAPIBase) Err() error {
 	case 40140125: // access_token invalid (expired or authorization revoked)
 		// Try refreshing token first
 		return NewTokenError(out, false)
+	case 40140126: // access_token verification failed
+		// Attempt to refresh the access token before forcing re-login
+		return NewTokenError(out, false)
 	}
 
 	return errors.New(out)
