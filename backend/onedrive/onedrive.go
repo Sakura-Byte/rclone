@@ -608,20 +608,20 @@ func Config(ctx context.Context, name string, m configmap.Mapper, conf fs.Config
 	if err != nil {
 		return nil, err
 	}
+	oauthConf, err := makeOauthConfig(ctx, opt)
+	if err != nil {
+		return nil, err
+	}
 	_, graphURL := getRegionURL(m)
 
 	// Check to see if this is the start of the state machine execution
 	if conf.State == "" {
-		conf, err := makeOauthConfig(ctx, opt)
-		if err != nil {
-			return nil, err
-		}
 		return oauthutil.ConfigOut("choose_type", &oauthutil.Options{
-			OAuth2Config: conf,
+			OAuth2Config: oauthConf,
 		})
 	}
 
-	oAuthClient, _, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
+	oAuthClient, _, err := oauthutil.NewClient(ctx, name, m, oauthConf)
 	if err != nil {
 		return nil, fmt.Errorf("failed to configure OneDrive: %w", err)
 	}
