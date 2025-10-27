@@ -742,9 +742,11 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bo
 
 	for f.tokenRefreshing {
 		prevRefreshToken := f.refreshToken
+		prevAccessToken := f.accessToken
+		prevExpiry := f.tokenExpiry
 		fs.Debugf(f, "Token refresh already in progress, waiting")
 		f.tokenCond.Wait()
-		if f.refreshToken != prevRefreshToken {
+		if f.refreshToken != prevRefreshToken || f.accessToken != prevAccessToken || !f.tokenExpiry.Equal(prevExpiry) {
 			refreshTokenExpired = false
 			forceRefresh = false
 		}

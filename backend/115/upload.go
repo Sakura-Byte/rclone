@@ -586,20 +586,16 @@ func (f *Fs) initUploadOpenAPI(ctx context.Context, size int64, name, dirID, sha
 	var info api.UploadInitInfo // Response structure includes nested Data for OpenAPI
 	err := f.CallOpenAPI(ctx, &opts, nil, &info, false)
 	if err != nil {
-		// Try to extract more specific error information
-		var apiErr error
-		if errors.As(err, &apiErr) {
-			// If it's a parameter error (code 1001), provide more context
-			if strings.Contains(err.Error(), "参数错误") || strings.Contains(err.Error(), "1001") {
-				return nil, fmt.Errorf("OpenAPI initUpload failed with parameter error: %w (file_name=%q, size=%d, dirID=%s)",
-					err, name, size, dirID)
-			}
+		// If it's a parameter error (code 1001), provide more context
+		if strings.Contains(err.Error(), "参数错误") || strings.Contains(err.Error(), "1001") {
+			return nil, fmt.Errorf("OpenAPI initUpload failed with parameter error: %w (file_name=%q, size=%d, dirID=%s)",
+				err, name, size, dirID)
+		}
 
-			// If it's a rate limit error, provide advice
-			if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "Too Many Requests") {
-				return nil, fmt.Errorf("OpenAPI initUpload failed due to rate limiting: %w. Consider using --low-level-retries flag to increase retries",
-					err)
-			}
+		// If it's a rate limit error, provide advice
+		if strings.Contains(err.Error(), "429") || strings.Contains(err.Error(), "Too Many Requests") {
+			return nil, fmt.Errorf("OpenAPI initUpload failed due to rate limiting: %w. Consider using --low-level-retries flag to increase retries",
+				err)
 		}
 
 		// General error handling
