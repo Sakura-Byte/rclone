@@ -67,8 +67,9 @@ const (
 	StreamUploadLimit   = 5 * fs.Gibi // Max size for sample/streamed upload (traditional)
 	maxUploadCutoff     = 5 * fs.Gibi // maximum allowed size for singlepart uploads (OSS PutObject limit)
 
-	tokenRefreshWindow = 10 * time.Minute // Refresh token 10 minutes before expiry
-	pkceVerifierLength = 64               // Length for PKCE code verifier
+	defaultTokenRefreshWindow = 10 * time.Minute // Refresh token 10 minutes before expiry when lifetime permits
+	minTokenRefreshWindow     = 30 * time.Second // Clamp refresh lead for very short-lived tokens
+	pkceVerifierLength        = 64               // Length for PKCE code verifier
 )
 
 // TraditionalRequest is the standard 115.com request structure for traditional API
@@ -306,15 +307,32 @@ type Fs struct {
 	m             configmap.Mapper // config map for saving tokens
 
 	// Token management
-	tokenMu         sync.Mutex
-	tokenCond       *sync.Cond
-	tokenRefreshing bool
-	accessToken     string
-	refreshToken    string
-	tokenExpiry     time.Time
-	codeVerifier    string // For PKCE
-	tokenRenewer    *oauthutil.Renew
-	loginMu         sync.Mutex
+	tokenMu          sync.Mutex
+	tokenCond        *sync.Cond
+	tokenRefreshing  bool
+	accessToken      string
+	refreshToken     string
+	tokenExpiry      time.Time
+	tokenRefreshLead time.Duration
+	codeVerifier     string // For PKCE
+	tokenRenewer     *oauthutil.Renew
+	loginMu          sync.Mutex
+}
+
+func (f *Fs) notifyTokenRenewerLocked() {
+	if f.tokenRenewer == nil {
+		return
+	}
+	if f.accessToken == "" || f.refreshToken == "" {
+		return
+	}
+	token := &oauth2.Token{
+		AccessToken:  f.accessToken,
+		TokenType:    "Bearer",
+		RefreshToken: f.refreshToken,
+		Expiry:       f.tokenExpiry,
+	}
+	f.tokenRenewer.UpdateToken(token)
 }
 
 // Object describes a 115 object
@@ -725,10 +743,18 @@ func (f *Fs) exchangeDeviceCodeForToken(ctx context.Context, loginUID string) er
 	}
 
 	// Store tokens
+	now := time.Now()
+	lifetime := time.Duration(tokenResp.Data.ExpiresIn) * time.Second
+
+	f.tokenMu.Lock()
 	f.accessToken = tokenResp.Data.AccessToken
 	f.refreshToken = tokenResp.Data.RefreshToken
-	f.tokenExpiry = time.Now().Add(time.Duration(tokenResp.Data.ExpiresIn) * time.Second)
-	fs.Debugf(f, "Successfully obtained access token, expires at %v", f.tokenExpiry)
+	f.tokenExpiry = now.Add(lifetime)
+	f.tokenRefreshLead = computeRefreshLead(lifetime)
+	f.notifyTokenRenewerLocked()
+	f.tokenMu.Unlock()
+
+	fs.Debugf(f, "Successfully obtained access token, expires at %v (refresh lead %v)", f.tokenExpiry, f.tokenRefreshLead)
 
 	return nil
 }
@@ -757,10 +783,12 @@ func (f *Fs) refreshTokenIfNecessary(ctx context.Context, refreshTokenExpired bo
 		}
 	}
 
-	if !refreshTokenExpired && !forceRefresh && isTokenStillValid(f) {
-		fs.Debugf(f, "Token is still valid after acquiring lock, skipping refresh")
-		f.tokenMu.Unlock()
-		return nil
+	if !refreshTokenExpired && isTokenStillValid(f) {
+		if !forceRefresh {
+			fs.Debugf(f, "Token is still valid after acquiring lock, skipping refresh")
+			f.tokenMu.Unlock()
+			return nil
+		}
 	}
 
 	if shouldPerformFullLogin(f, refreshTokenExpired) {
@@ -814,8 +842,65 @@ func shouldPerformFullLogin(f *Fs, refreshTokenExpired bool) bool {
 }
 
 // isTokenStillValid checks if the current token is still valid
+func computeRefreshLead(lifetime time.Duration) time.Duration {
+	if lifetime <= 0 {
+		return 0
+	}
+
+	lead := defaultTokenRefreshWindow
+	if lifetime <= lead {
+		lead = lifetime / 2
+	}
+
+	if lifetime > minTokenRefreshWindow && lead < minTokenRefreshWindow {
+		lead = minTokenRefreshWindow
+	}
+
+	if lead >= lifetime {
+		lead = lifetime / 2
+		if lead < 0 {
+			lead = 0
+		}
+	}
+
+	return lead
+}
+
+func (f *Fs) refreshLead() time.Duration {
+	lead := f.tokenRefreshLead
+	if lead <= 0 {
+		return 0
+	}
+	remaining := time.Until(f.tokenExpiry)
+	if remaining <= 0 {
+		return 0
+	}
+	if lead >= remaining {
+		return computeRefreshLead(remaining)
+	}
+	return lead
+}
+
+func (f *Fs) shouldRefreshTokens() bool {
+	if f.tokenExpiry.IsZero() {
+		return true
+	}
+
+	now := time.Now()
+	if !now.Before(f.tokenExpiry) {
+		return true
+	}
+
+	lead := f.refreshLead()
+	if lead <= 0 {
+		return false
+	}
+
+	return !now.Before(f.tokenExpiry.Add(-lead))
+}
+
 func isTokenStillValid(f *Fs) bool {
-	return time.Now().Before(f.tokenExpiry.Add(-tokenRefreshWindow))
+	return !f.shouldRefreshTokens()
 }
 
 // performTokenRefresh handles the actual API call to refresh the token
@@ -946,13 +1031,17 @@ func (f *Fs) updateTokensLocked(refreshResp *api.RefreshTokenResp) {
 		return
 	}
 
+	now := time.Now()
+	lifetime := time.Duration(refreshResp.Data.ExpiresIn) * time.Second
 	f.accessToken = refreshResp.Data.AccessToken
 	// OpenAPI spec says refresh_token might be updated, so store the new one
 	if refreshResp.Data.RefreshToken != "" {
 		f.refreshToken = refreshResp.Data.RefreshToken
 	}
-	f.tokenExpiry = time.Now().Add(time.Duration(refreshResp.Data.ExpiresIn) * time.Second)
-	fs.Debugf(f, "Token refreshed successfully, new expiry: %v", f.tokenExpiry)
+	f.tokenExpiry = now.Add(lifetime)
+	f.tokenRefreshLead = computeRefreshLead(lifetime)
+	f.notifyTokenRenewerLocked()
+	fs.Debugf(f, "Token refreshed successfully, new expiry: %v (refresh lead %v)", f.tokenExpiry, f.tokenRefreshLead)
 }
 
 // updateTokens updates the token values with new values from a refresh response
@@ -1516,8 +1605,8 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	var tokenRefreshNeeded bool
 	if tokenLoaded {
 		// Check if token is expired or will expire soon
-		if time.Now().After(f.tokenExpiry.Add(-tokenRefreshWindow)) {
-			fs.Debugf(f, "Token expired or will expire soon, refreshing now")
+		if f.shouldRefreshTokens() {
+			fs.Debugf(f, "Token expired or approaching refresh window (%v), refreshing now", f.refreshLead())
 			tokenRefreshNeeded = true
 		}
 	} else if f.opt.Cookie != "" {
@@ -2799,12 +2888,17 @@ func loadTokenFromConfig(f *Fs, m configmap.Mapper) bool {
 	f.accessToken = token.AccessToken
 	f.refreshToken = token.RefreshToken
 	f.tokenExpiry = token.Expiry
+	remaining := time.Until(f.tokenExpiry)
+	if remaining < 0 {
+		remaining = 0
+	}
+	f.tokenRefreshLead = computeRefreshLead(remaining)
 
 	// Check if we got valid token data
 	if f.accessToken == "" || f.refreshToken == "" {
 		return false
 	}
 
-	fs.Debugf(f, "Loaded token from config file, expires at %v", f.tokenExpiry)
+	fs.Debugf(f, "Loaded token from config file, expires at %v (refresh lead %v)", f.tokenExpiry, f.tokenRefreshLead)
 	return true
 }

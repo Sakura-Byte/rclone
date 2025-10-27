@@ -5,6 +5,7 @@ import (
 	"sync/atomic"
 
 	"github.com/rclone/rclone/fs"
+	"golang.org/x/oauth2"
 )
 
 // Renew allows tokens to be renewed on expiry if uploads are in progress.
@@ -91,4 +92,34 @@ func (r *Renew) Shutdown() {
 		r.ts.expiryTimer.Stop()
 		close(r.done)
 	})
+}
+
+// UpdateToken synchronizes the underlying token source with a freshly obtained token.
+func (r *Renew) UpdateToken(token *oauth2.Token) {
+	if r == nil || token == nil {
+		return
+	}
+
+	r.ts.mu.Lock()
+	defer r.ts.mu.Unlock()
+
+	if r.ts.token == nil {
+		r.ts.token = &oauth2.Token{}
+	}
+	*r.ts.token = *token
+	r.ts.tokenSource = nil
+
+	if r.ts.expiryTimer != nil {
+		d := r.ts.timeToExpiry()
+		if d < 0 {
+			d = 0
+		}
+		if !r.ts.expiryTimer.Stop() {
+			select {
+			case <-r.ts.expiryTimer.C:
+			default:
+			}
+		}
+		r.ts.expiryTimer.Reset(d)
+	}
 }
