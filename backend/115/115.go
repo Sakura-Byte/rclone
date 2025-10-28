@@ -316,6 +316,7 @@ type Fs struct {
 	tokenRefreshLead time.Duration
 	codeVerifier     string // For PKCE
 	tokenRenewer     *oauthutil.Renew
+	requestTokens    sync.Map // track tokens used per request to avoid redundant refreshes
 	loginMu          sync.Mutex
 }
 
@@ -333,6 +334,32 @@ func (f *Fs) notifyTokenRenewerLocked() {
 		Expiry:       f.tokenExpiry,
 	}
 	f.tokenRenewer.UpdateToken(token)
+}
+
+func (f *Fs) rememberRequestToken(opts *rest.Opts, token string) {
+	if opts == nil || token == "" {
+		return
+	}
+	f.requestTokens.Store(opts, token)
+}
+
+func (f *Fs) requestTokenUsed(opts *rest.Opts) (string, bool) {
+	if opts == nil {
+		return "", false
+	}
+	if value, ok := f.requestTokens.Load(opts); ok {
+		if token, ok := value.(string); ok {
+			return token, true
+		}
+	}
+	return "", false
+}
+
+func (f *Fs) forgetRequestToken(opts *rest.Opts) {
+	if opts == nil {
+		return
+	}
+	f.requestTokens.Delete(opts)
 }
 
 // Object describes a 115 object
@@ -1153,6 +1180,10 @@ func (f *Fs) CallOpenAPI(ctx context.Context, opts *rest.Opts, request any, resp
 		opts.RootURL = openAPIRootURL
 	}
 
+	if !skipToken {
+		defer f.forgetRequestToken(opts)
+	}
+
 	// Wrap the entire attempt sequence with the global pacer, returning proper retry signals
 	return f.globalPacer.Call(func() (shouldRetryGlobal bool, errGlobal error) {
 		// Ensure token is available and current
@@ -1221,6 +1252,8 @@ func (f *Fs) prepareTokenForRequest(ctx context.Context, opts *rest.Opts) error 
 	token := f.accessToken
 	f.tokenMu.Unlock()
 
+	f.rememberRequestToken(opts, token)
+
 	if opts.ExtraHeaders == nil {
 		opts.ExtraHeaders = make(map[string]string)
 	}
@@ -1252,6 +1285,27 @@ func (f *Fs) handleTokenError(ctx context.Context, opts *rest.Opts, apiErr error
 	var tokenErr *api.TokenError
 	if errors.As(apiErr, &tokenErr) {
 		fs.Debugf(f, "Token error detected: %v (relogin needed: %v)", tokenErr, tokenErr.IsRefreshTokenExpired)
+
+		// If another goroutine already rotated the token since this request started, just retry with the new token.
+		if !tokenErr.IsRefreshTokenExpired {
+			if tokenUsed, ok := f.requestTokenUsed(opts); ok {
+				f.tokenMu.Lock()
+				currentToken := f.accessToken
+				f.tokenMu.Unlock()
+				if currentToken != "" && currentToken != tokenUsed {
+					fs.Debugf(f, "Token already refreshed by another request, retrying without additional refresh")
+					if !skipToken {
+						if opts.ExtraHeaders == nil {
+							opts.ExtraHeaders = make(map[string]string)
+						}
+						opts.ExtraHeaders["Authorization"] = "Bearer " + currentToken
+						f.rememberRequestToken(opts, currentToken)
+					}
+					return true, nil
+				}
+			}
+		}
+
 		// Handle token refresh/re-login using refreshTokenIfNecessary
 		refreshErr := f.refreshTokenIfNecessary(ctx, tokenErr.IsRefreshTokenExpired, !tokenErr.IsRefreshTokenExpired)
 		if refreshErr != nil {
