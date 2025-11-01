@@ -575,13 +575,14 @@ func (f *Fs) login(ctx context.Context) error {
 	defer f.loginMu.Unlock()
 
 	f.tokenMu.Lock()
+	tokenValid := f.accessToken != "" && time.Now().Before(f.tokenExpiry)
+	f.tokenMu.Unlock()
+
 	// Check if another thread has successfully logged in while we were waiting
-	if f.accessToken != "" && time.Now().Before(f.tokenExpiry) {
+	if tokenValid {
 		fs.Debugf(f, "Token is already valid after waiting for login mutex, skipping login")
-		f.tokenMu.Unlock()
 		return nil
 	}
-	defer f.tokenMu.Unlock()
 
 	// Parse cookie and setup clients
 	if err := f.setupLoginEnvironment(ctx); err != nil {
