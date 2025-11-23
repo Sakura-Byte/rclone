@@ -2,6 +2,7 @@ package _115
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -326,28 +327,57 @@ func (f *Fs) indexInfo(ctx context.Context) (data *api.IndexData, err error) {
 	return info.Data, nil
 }
 
+// Some downurl responses return an empty array instead of an object, which breaks JSON unmarshalling.
+// Treat that as a transient server glitch and retry once.
+func isDownurlDataArrayError(err error) bool {
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		if typeErr.Struct == "OpenAPIDownloadResp" && strings.EqualFold(typeErr.Field, "data") && typeErr.Value == "array" {
+			return true
+		}
+	}
+	// Fallback string check in case the error shape changes.
+	return strings.Contains(err.Error(), "OpenAPIDownloadResp.data") && strings.Contains(err.Error(), "cannot unmarshal array")
+}
+
+func (f *Fs) getOpenAPIDownloadResp(ctx context.Context, pickCode string) (*api.OpenAPIDownloadResp, error) {
+	form := url.Values{"pick_code": {pickCode}}
+	const maxAttempts = 2
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		opts := rest.Opts{
+			Method: "POST",
+			Path:   "/open/ufile/downurl",
+			Body:   strings.NewReader(form.Encode()),
+			ExtraHeaders: map[string]string{
+				"Content-Type": "application/x-www-form-urlencoded",
+			},
+		}
+
+		var respData api.OpenAPIDownloadResp
+		err := f.CallOpenAPI(ctx, &opts, nil, &respData, false)
+		if err == nil {
+			return &respData, nil
+		}
+
+		if attempt < maxAttempts && isDownurlDataArrayError(err) {
+			fs.Debugf(f, "downurl returned array data for pickcode %s, retrying attempt %d/%d", pickCode, attempt+1, maxAttempts)
+			continue
+		}
+
+		return nil, fmt.Errorf("OpenAPI downurl failed for pickcode %s: %w", pickCode, err)
+	}
+	return nil, fmt.Errorf("OpenAPI downurl retries exhausted for pickcode %s", pickCode)
+}
+
 // getDownloadURL gets a download URL using OpenAPI.
 func (f *Fs) getDownloadURL(ctx context.Context, pickCode string) (durl *api.DownloadURL, err error) {
 	if f.isShare {
 		// Should call getDownloadURLFromShare for shared links
 		return nil, errors.New("use getDownloadURLFromShare for shared filesystems")
 	}
-	form := url.Values{}
-	form.Set("pick_code", pickCode)
-
-	opts := rest.Opts{
-		Method: "POST",
-		Path:   "/open/ufile/downurl",
-		Body:   strings.NewReader(form.Encode()),
-		ExtraHeaders: map[string]string{
-			"Content-Type": "application/x-www-form-urlencoded",
-		},
-	}
-
-	var respData api.OpenAPIDownloadResp
-	err = f.CallOpenAPI(ctx, &opts, nil, &respData, false)
+	respData, err := f.getOpenAPIDownloadResp(ctx, pickCode)
 	if err != nil {
-		return nil, fmt.Errorf("OpenAPI downurl failed for pickcode %s: %w", pickCode, err)
+		return nil, err
 	}
 
 	// The response data is a map where the key is the file ID.
@@ -386,13 +416,7 @@ func (f *Fs) getFile(ctx context.Context, fid, pc string) (file *api.File, err e
 
 	if pc != "" {
 		// Try getting info via downurl endpoint
-		form := url.Values{"pick_code": {pc}}
-		opts := rest.Opts{
-			Method: "POST", Path: "/open/ufile/downurl", Body: strings.NewReader(form.Encode()),
-			ExtraHeaders: map[string]string{"Content-Type": "application/x-www-form-urlencoded"},
-		}
-		var respData api.OpenAPIDownloadResp
-		apiErr := f.CallOpenAPI(ctx, &opts, nil, &respData, false)
+		respData, apiErr := f.getOpenAPIDownloadResp(ctx, pc)
 		if apiErr == nil {
 			for itemFid, downInfo := range respData.Data {
 				if downInfo != nil {
