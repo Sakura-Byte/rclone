@@ -342,7 +342,7 @@ func isDownurlDataArrayError(err error) bool {
 
 func (f *Fs) getOpenAPIDownloadResp(ctx context.Context, pickCode string) (*api.OpenAPIDownloadResp, error) {
 	form := url.Values{"pick_code": {pickCode}}
-	const maxAttempts = 2
+	const maxAttempts = 5
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		opts := rest.Opts{
 			Method: "POST",
