@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -83,6 +84,34 @@ All done. Please go back to rclone.
 </html>
 `
 )
+
+// normalizeAuthCode tries to pull a base64-ish payload out of noisy input (e.g. pasted prompts).
+func normalizeAuthCode(raw string) string {
+	s := strings.TrimSpace(raw)
+
+	// Drop any prompt-like prefix such as "config_token>" or "token=" that might have been pasted.
+	lower := strings.ToLower(s)
+	if idx := strings.LastIndex(lower, "config_token"); idx >= 0 {
+		s = strings.TrimLeft(s[idx+len("config_token"):], "> :\t")
+	}
+	if strings.HasPrefix(strings.ToLower(s), "token=") {
+		s = strings.TrimSpace(s[len("token="):])
+	}
+
+	// Prefer the longest contiguous base64-ish blob if there is extra surrounding text.
+	re := regexp.MustCompile(`[A-Za-z0-9+/=_-]{20,}`)
+	if matches := re.FindAllString(s, -1); len(matches) > 0 {
+		longest := matches[0]
+		for _, candidate := range matches[1:] {
+			if len(candidate) > len(longest) {
+				longest = candidate
+			}
+		}
+		return strings.TrimSpace(longest)
+	}
+
+	return s
+}
 
 // OpenURL is used when rclone wants to open a browser window
 // for user authentication. It defaults to something which
@@ -690,7 +719,7 @@ version recommended):
 		// Read the updates to the config
 		outM := configmap.Simple{}
 		token := oauth2.Token{}
-		code := in.Result
+		code := normalizeAuthCode(in.Result)
 
 		// Primary path: new format where the token and config map come in base64.
 		if err := outM.Decode(code); err == nil {
