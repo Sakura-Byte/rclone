@@ -3,6 +3,7 @@ package oauthutil
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config"
@@ -689,24 +691,54 @@ version recommended):
 		outM := configmap.Simple{}
 		token := oauth2.Token{}
 		code := in.Result
-		newFormat := true
-		err := outM.Decode(code)
-		if err != nil {
-			newFormat = false
-			err = json.Unmarshal([]byte(code), &token)
-		}
-		if err != nil {
-			return fs.ConfigError(newState("*oauth-authorize"), fmt.Sprintf("Couldn't decode response - try again (make sure you are using a matching version of rclone on both sides: %v\n", err))
-		}
-		// Save the config updates
-		if newFormat {
+
+		// Primary path: new format where the token and config map come in base64.
+		if err := outM.Decode(code); err == nil {
 			for k, v := range outM {
 				m.Set(k, v)
 				fs.Debugf(nil, "received %s = %q", k, v)
 			}
-		} else {
-			m.Set(fs.ConfigToken, code)
+			return fs.ConfigGoto(newState("*oauth-done"))
 		}
+
+		// Fallback: handle base64 encoded JSON tokens/maps even if the map decode failed.
+		trimmed := strings.Map(func(r rune) rune {
+			if unicode.IsSpace(r) {
+				return -1
+			}
+			return r
+		}, code)
+		if decoded, decodeErr := base64.RawStdEncoding.DecodeString(trimmed); decodeErr == nil {
+			if err := json.Unmarshal(decoded, &outM); err == nil {
+				for k, v := range outM {
+					m.Set(k, v)
+					fs.Debugf(nil, "received %s = %q", k, v)
+				}
+				return fs.ConfigGoto(newState("*oauth-done"))
+			}
+			if err := json.Unmarshal(decoded, &token); err == nil {
+				m.Set(fs.ConfigToken, string(decoded))
+				return fs.ConfigGoto(newState("*oauth-done"))
+			}
+		} else if decoded, decodeErr := base64.StdEncoding.DecodeString(trimmed); decodeErr == nil {
+			if err := json.Unmarshal(decoded, &outM); err == nil {
+				for k, v := range outM {
+					m.Set(k, v)
+					fs.Debugf(nil, "received %s = %q", k, v)
+				}
+				return fs.ConfigGoto(newState("*oauth-done"))
+			}
+			if err := json.Unmarshal(decoded, &token); err == nil {
+				m.Set(fs.ConfigToken, string(decoded))
+				return fs.ConfigGoto(newState("*oauth-done"))
+			}
+		}
+
+		// Legacy path: raw JSON token.
+		if err := json.Unmarshal([]byte(code), &token); err != nil {
+			return fs.ConfigError(newState("*oauth-authorize"), fmt.Sprintf("Couldn't decode response - try again (make sure you are using a matching version of rclone on both sides: %v\n", err))
+		}
+		m.Set(fs.ConfigToken, code)
 		return fs.ConfigGoto(newState("*oauth-done"))
 	case "*oauth-do":
 		// Make sure we can read the HTML template file if it was specified.
