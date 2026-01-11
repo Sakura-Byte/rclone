@@ -831,6 +831,13 @@ func (f *Fs) getDownloadInfo(ctx context.Context, remote string) (*downloadInfo,
 		u = strings.ReplaceAll(u, "{SCHEME}", f.baseScheme)
 		u = strings.ReplaceAll(u, "{HOST}", f.baseHost)
 		u = strings.ReplaceAll(u, "{PREVIEW}", "false")
+
+		// --- 添加修复代码开始 ---
+		// 如果返回的是相对路径，需要拼接完整的 URL
+		if strings.HasPrefix(u, "/") {
+			u = fmt.Sprintf("%s://%s%s", f.baseScheme, f.baseHost, u)
+		}
+		// --- 添加修复代码结束 ---
 	}
 	headers := map[string]string{}
 	for k, v := range res.GetAdditionalHeaders() {
