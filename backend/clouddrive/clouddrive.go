@@ -17,6 +17,7 @@ import (
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/config/obscure"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
 	"google.golang.org/grpc"
@@ -138,7 +139,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		return nil, err
 	}
 
-	token := opt.Token
+	token := obscure.MustReveal(opt.Token)
 	if token == "" {
 		token, err = fetchToken(ctx, client, opt)
 		if err != nil {
@@ -240,7 +241,7 @@ func fetchToken(ctx context.Context, client api.CloudDriveFileSrvClient, opt Opt
 	}
 	req := &api.GetTokenRequest{
 		UserName: opt.Username,
-		Password: opt.Password,
+		Password: obscure.MustReveal(opt.Password),
 	}
 	if opt.TOTP != "" {
 		req.TotpCode = &opt.TOTP
