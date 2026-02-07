@@ -18,8 +18,10 @@ import (
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/config/obscure"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/pacer"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -32,6 +34,9 @@ import (
 const (
 	defaultChunkSize = 4 * 1024 * 1024
 	defaultTimeout   = 30 * time.Second
+	minSleep         = 10 * time.Millisecond
+	maxSleep         = 2 * time.Second
+	decayConstant    = 2 // bigger makes penalise more for consecutive failures
 )
 
 // Options defines the configuration for this backend
@@ -58,6 +63,7 @@ type Fs struct {
 	token      string
 	baseScheme string
 	baseHost   string
+	pacer      *fs.Pacer // pacer for API rate limiting and retries
 }
 
 // Object describes a clouddrive object
@@ -159,6 +165,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		conn:       conn,
 		token:      token,
 		httpClient: fshttp.NewClient(ctx),
+		pacer:      fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.baseScheme, f.baseHost = f.detectDownloadEndpoint()
 
@@ -235,25 +242,46 @@ func dial(ctx context.Context, opt Options) (*grpc.ClientConn, api.CloudDriveFil
 }
 
 // fetchToken exchanges username/password for JWT when token is empty.
-func fetchToken(ctx context.Context, client api.CloudDriveFileSrvClient, opt Options) (string, error) {
+func fetchToken(ctx context.Context, client api.CloudDriveFileSrvClient, opt Options) (token string, err error) {
 	if opt.Username == "" || opt.Password == "" {
 		return "", errors.New("token not set and missing user/pass")
 	}
-	req := &api.GetTokenRequest{
-		UserName: opt.Username,
-		Password: obscure.MustReveal(opt.Password),
-	}
-	if opt.TOTP != "" {
-		req.TotpCode = &opt.TOTP
-	}
-	resp, err := client.GetToken(ctx, req)
-	if err != nil {
-		return "", err
-	}
-	if !resp.GetSuccess() {
-		return "", fmt.Errorf("token request failed: %s", resp.GetErrorMessage())
-	}
-	return resp.GetToken(), nil
+	// Use a temporary pacer for login
+	pctr := fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))
+	err = pctr.Call(func() (bool, error) {
+		req := &api.GetTokenRequest{
+			UserName: opt.Username,
+			Password: obscure.MustReveal(opt.Password),
+		}
+		if opt.TOTP != "" {
+			req.TotpCode = &opt.TOTP
+		}
+		resp, err := client.GetToken(ctx, req)
+		if err != nil {
+			// Reuse logic from shouldRetry but we don't have Fs instance
+			if fserrors.ContextError(ctx, &err) {
+				return false, err
+			}
+			if err == nil {
+				return false, nil
+			}
+			if fserrors.ShouldRetry(err) {
+				return true, err
+			}
+			if s, ok := status.FromError(err); ok {
+				if s.Code() == codes.Unavailable {
+					return true, err
+				}
+			}
+			return false, err
+		}
+		if !resp.GetSuccess() {
+			return false, fmt.Errorf("token request failed: %s", resp.GetErrorMessage())
+		}
+		token = resp.GetToken()
+		return false, nil
+	})
+	return token, err
 }
 
 // Name of the remote (as passed into NewFs)
@@ -326,30 +354,37 @@ func (f *Fs) withAuth(ctx context.Context) context.Context {
 // List the objects and directories in dir.
 func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err error) {
 	ctx = f.withAuth(ctx)
-	req := &api.ListSubFileRequest{
-		Path:         f.fullPath(dir),
-		ForceRefresh: false,
-	}
-	stream, err := f.client.GetSubFiles(ctx, req)
-	if err != nil {
-		return nil, translateError(err)
-	}
-	for {
-		resp, recErr := stream.Recv()
-		if recErr == io.EOF {
-			break
+	err = f.pacer.Call(func() (bool, error) {
+		entries = nil
+		req := &api.ListSubFileRequest{
+			Path:         f.fullPath(dir),
+			ForceRefresh: false,
 		}
-		if recErr != nil {
-			return nil, translateError(recErr)
+		stream, err := f.client.GetSubFiles(ctx, req)
+		if err != nil {
+			return f.shouldRetry(ctx, err)
 		}
-		for _, item := range resp.GetSubFiles() {
-			remote := path.Join(dir, item.GetName())
-			if item.GetIsDirectory() || item.GetFileType() == api.CloudDriveFile_Directory {
-				entries = append(entries, fs.NewDir(remote, timestampToTime(item.GetWriteTime())))
-			} else {
-				entries = append(entries, f.newObjectFromItem(remote, item))
+		for {
+			resp, recErr := stream.Recv()
+			if recErr == io.EOF {
+				break
+			}
+			if recErr != nil {
+				return f.shouldRetry(ctx, recErr)
+			}
+			for _, item := range resp.GetSubFiles() {
+				remote := path.Join(dir, item.GetName())
+				if item.GetIsDirectory() || item.GetFileType() == api.CloudDriveFile_Directory {
+					entries = append(entries, fs.NewDir(remote, timestampToTime(item.GetWriteTime())))
+				} else {
+					entries = append(entries, f.newObjectFromItem(remote, item))
+				}
 			}
 		}
+		return false, nil
+	})
+	if err != nil {
+		return nil, translateError(err)
 	}
 	return entries, nil
 }
@@ -362,18 +397,21 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	if parent == "" {
 		parent = "/"
 	}
-	req := &api.CreateFolderRequest{
-		ParentPath: strings.TrimSuffix(parent, "/"),
-		FolderName: strings.Trim(leaf, "/"),
-	}
-	res, err := f.client.CreateFolder(ctx, req)
-	if err != nil {
-		return translateError(err)
-	}
-	if res.GetResult() != nil && !res.GetResult().GetSuccess() {
-		return errors.New(res.GetResult().GetErrorMessage())
-	}
-	return nil
+	err := f.pacer.Call(func() (bool, error) {
+		req := &api.CreateFolderRequest{
+			ParentPath: strings.TrimSuffix(parent, "/"),
+			FolderName: strings.Trim(leaf, "/"),
+		}
+		res, err := f.client.CreateFolder(ctx, req)
+		if err != nil {
+			return f.shouldRetry(ctx, err)
+		}
+		if res.GetResult() != nil && !res.GetResult().GetSuccess() {
+			return false, errors.New(res.GetResult().GetErrorMessage())
+		}
+		return false, nil
+	})
+	return translateError(err)
 }
 
 // Rmdir removes the directory
@@ -383,15 +421,18 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if p == "/" {
 		return errors.New("refusing to delete root")
 	}
-	req := &api.FileRequest{Path: p}
-	res, err := f.client.DeleteFile(ctx, req)
-	if err != nil {
-		return translateError(err)
-	}
-	if !res.GetSuccess() {
-		return errors.New(res.GetErrorMessage())
-	}
-	return nil
+	err := f.pacer.Call(func() (bool, error) {
+		req := &api.FileRequest{Path: p}
+		res, err := f.client.DeleteFile(ctx, req)
+		if err != nil {
+			return f.shouldRetry(ctx, err)
+		}
+		if !res.GetSuccess() {
+			return false, errors.New(res.GetErrorMessage())
+		}
+		return false, nil
+	})
+	return translateError(err)
 }
 
 // NewObject finds the Object at remote.
@@ -407,7 +448,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 }
 
 // getFile fetches metadata for a remote path.
-func (f *Fs) getFile(ctx context.Context, remote string) (*api.CloudDriveFile, error) {
+func (f *Fs) getFile(ctx context.Context, remote string) (item *api.CloudDriveFile, err error) {
 	ctx = f.withAuth(ctx)
 	p := f.fullPath(remote)
 	parent, name := path.Split(p)
@@ -415,19 +456,27 @@ func (f *Fs) getFile(ctx context.Context, remote string) (*api.CloudDriveFile, e
 		parent = "/"
 	}
 
-	req := &api.FindFileByPathRequest{
-		ParentPath: strings.TrimSuffix(parent, "/"),
-		Path:       name,
+	err = f.pacer.Call(func() (bool, error) {
+		req := &api.FindFileByPathRequest{
+			ParentPath: strings.TrimSuffix(parent, "/"),
+			Path:       name,
+		}
+		item, err = f.client.FindFileByPath(ctx, req)
+		if err == nil {
+			return false, nil
+		}
+		if status.Code(err) == codes.Unimplemented {
+			// fallback to listing parent
+			// We don't pace getFileByListing here as it calls List which is paced
+			item, err = f.getFileByListing(ctx, remote)
+			return false, err
+		}
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, translateError(err)
 	}
-	item, err := f.client.FindFileByPath(ctx, req)
-	if err == nil {
-		return item, nil
-	}
-	if status.Code(err) == codes.Unimplemented {
-		// fallback to listing parent
-		return f.getFileByListing(ctx, remote)
-	}
-	return nil, translateError(err)
+	return item, nil
 }
 
 // getFileByListing lists the parent and finds the child.
@@ -473,16 +522,33 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		parentPath = "/"
 	}
 
-	createReq := &api.CreateFileRequest{
-		ParentPath: strings.TrimSuffix(parentPath, "/"),
-		FileName:   strings.Trim(fileName, "/"),
-	}
-	createRes, err := f.client.CreateFile(ctx, createReq)
+	var createRes *api.CreateFileResult
+	err := f.pacer.Call(func() (bool, error) {
+		createReq := &api.CreateFileRequest{
+			ParentPath: strings.TrimSuffix(parentPath, "/"),
+			FileName:   strings.Trim(fileName, "/"),
+		}
+		var err2 error
+		createRes, err2 = f.client.CreateFile(ctx, createReq)
+		if err2 != nil {
+			return f.shouldRetry(ctx, err2)
+		}
+		return false, nil
+	})
 	if err != nil {
 		return translateError(err)
 	}
 	handle := createRes.GetFileHandle()
-	stream, err := f.client.WriteToFileStream(ctx)
+
+	var stream api.CloudDriveFileSrv_WriteToFileStreamClient
+	err = f.pacer.Call(func() (bool, error) {
+		var err2 error
+		stream, err2 = f.client.WriteToFileStream(ctx)
+		if err2 != nil {
+			return f.shouldRetry(ctx, err2)
+		}
+		return false, nil
+	})
 	if err != nil {
 		return translateError(err)
 	}
@@ -580,17 +646,23 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
 	ctx = f.withAuth(ctx)
 	destDir, _ := path.Split(remote)
-	req := &api.CopyFileRequest{
-		TheFilePaths:   []string{f.fullPath(src.Remote())},
-		DestPath:       f.fullPath(strings.TrimSuffix(destDir, "/")),
-		ConflictPolicy: api.CopyFileRequest_Rename.Enum(),
-	}
-	res, err := f.client.CopyFile(ctx, req)
+	err := f.pacer.Call(func() (bool, error) {
+		req := &api.CopyFileRequest{
+			TheFilePaths:   []string{f.fullPath(src.Remote())},
+			DestPath:       f.fullPath(strings.TrimSuffix(destDir, "/")),
+			ConflictPolicy: api.CopyFileRequest_Rename.Enum(),
+		}
+		res, err := f.client.CopyFile(ctx, req)
+		if err != nil {
+			return f.shouldRetry(ctx, err)
+		}
+		if !res.GetSuccess() {
+			return false, errors.New(res.GetErrorMessage())
+		}
+		return false, nil
+	})
 	if err != nil {
 		return nil, translateError(err)
-	}
-	if !res.GetSuccess() {
-		return nil, errors.New(res.GetErrorMessage())
 	}
 	return f.NewObject(ctx, remote)
 }
@@ -602,17 +674,23 @@ func (f *Fs) moveFile(ctx context.Context, remotes []string, dstDir string) erro
 	for _, r := range remotes {
 		paths = append(paths, f.fullPath(r))
 	}
-	req := &api.MoveFileRequest{
-		TheFilePaths:   paths,
-		DestPath:       f.fullPath(strings.Trim(dstDir, "/")),
-		ConflictPolicy: api.MoveFileRequest_Rename.Enum(),
-	}
-	res, err := f.client.MoveFile(ctx, req)
+	err := f.pacer.Call(func() (bool, error) {
+		req := &api.MoveFileRequest{
+			TheFilePaths:   paths,
+			DestPath:       f.fullPath(strings.Trim(dstDir, "/")),
+			ConflictPolicy: api.MoveFileRequest_Rename.Enum(),
+		}
+		res, err := f.client.MoveFile(ctx, req)
+		if err != nil {
+			return f.shouldRetry(ctx, err)
+		}
+		if !res.GetSuccess() {
+			return false, errors.New(res.GetErrorMessage())
+		}
+		return false, nil
+	})
 	if err != nil {
 		return translateError(err)
-	}
-	if !res.GetSuccess() {
-		return errors.New(res.GetErrorMessage())
 	}
 	return nil
 }
@@ -620,16 +698,22 @@ func (f *Fs) moveFile(ctx context.Context, remotes []string, dstDir string) erro
 // rename changes the base name of a path within its parent.
 func (f *Fs) rename(ctx context.Context, remote, newName string) error {
 	ctx = f.withAuth(ctx)
-	req := &api.RenameFileRequest{
-		TheFilePath: f.fullPath(remote),
-		NewName:     newName,
-	}
-	res, err := f.client.RenameFile(ctx, req)
+	err := f.pacer.Call(func() (bool, error) {
+		req := &api.RenameFileRequest{
+			TheFilePath: f.fullPath(remote),
+			NewName:     newName,
+		}
+		res, err := f.client.RenameFile(ctx, req)
+		if err != nil {
+			return f.shouldRetry(ctx, err)
+		}
+		if !res.GetSuccess() {
+			return false, errors.New(res.GetErrorMessage())
+		}
+		return false, nil
+	})
 	if err != nil {
 		return translateError(err)
-	}
-	if !res.GetSuccess() {
-		return errors.New(res.GetErrorMessage())
 	}
 	return nil
 }
@@ -813,40 +897,48 @@ type downloadInfo struct {
 }
 
 // getDownloadInfo resolves a download URL for a path.
-func (f *Fs) getDownloadInfo(ctx context.Context, remote string) (*downloadInfo, error) {
+func (f *Fs) getDownloadInfo(ctx context.Context, remote string) (info *downloadInfo, err error) {
 	ctx = f.withAuth(ctx)
-	req := &api.GetDownloadUrlPathRequest{
-		Path:         f.fullPath(remote),
-		Preview:      false,
-		LazyRead:     false,
-		GetDirectUrl: true,
-	}
-	res, err := f.client.GetDownloadUrlPath(ctx, req)
+	err = f.pacer.Call(func() (bool, error) {
+		req := &api.GetDownloadUrlPathRequest{
+			Path:         f.fullPath(remote),
+			Preview:      false,
+			LazyRead:     false,
+			GetDirectUrl: true,
+		}
+		res, err := f.client.GetDownloadUrlPath(ctx, req)
+		if err != nil {
+			return f.shouldRetry(ctx, err)
+		}
+		u := res.GetDirectUrl()
+		if u == "" {
+			u = res.GetDownloadUrlPath()
+			u = strings.ReplaceAll(u, "{SCHEME}", f.baseScheme)
+			u = strings.ReplaceAll(u, "{HOST}", f.baseHost)
+			u = strings.ReplaceAll(u, "{PREVIEW}", "false")
+
+			// --- 添加修复代码开始 ---
+			// 如果返回的是相对路径，需要拼接完整的 URL
+			if strings.HasPrefix(u, "/") {
+				u = fmt.Sprintf("%s://%s%s", f.baseScheme, f.baseHost, u)
+			}
+			// --- 添加修复代码结束 ---
+		}
+		headers := map[string]string{}
+		for k, v := range res.GetAdditionalHeaders() {
+			headers[k] = v
+		}
+		if ua := res.GetUserAgent(); ua != "" {
+			headers["User-Agent"] = ua
+		}
+		info = &downloadInfo{url: u, headers: headers}
+		return false, nil
+	})
+
 	if err != nil {
 		return nil, translateError(err)
 	}
-	u := res.GetDirectUrl()
-	if u == "" {
-		u = res.GetDownloadUrlPath()
-		u = strings.ReplaceAll(u, "{SCHEME}", f.baseScheme)
-		u = strings.ReplaceAll(u, "{HOST}", f.baseHost)
-		u = strings.ReplaceAll(u, "{PREVIEW}", "false")
-
-		// --- 添加修复代码开始 ---
-		// 如果返回的是相对路径，需要拼接完整的 URL
-		if strings.HasPrefix(u, "/") {
-			u = fmt.Sprintf("%s://%s%s", f.baseScheme, f.baseHost, u)
-		}
-		// --- 添加修复代码结束 ---
-	}
-	headers := map[string]string{}
-	for k, v := range res.GetAdditionalHeaders() {
-		headers[k] = v
-	}
-	if ua := res.GetUserAgent(); ua != "" {
-		headers["User-Agent"] = ua
-	}
-	return &downloadInfo{url: u, headers: headers}, nil
+	return info, nil
 }
 
 // extractHashes converts fileHashes map to hash.Type keyed map.
@@ -885,4 +977,25 @@ func translateError(err error) error {
 		}
 	}
 	return err
+}
+
+// shouldRetry returns a boolean as to whether this err deserves to be
+// retried.  It returns the err as a convenience
+func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
+	if fserrors.ContextError(ctx, &err) {
+		return false, err
+	}
+	if err == nil {
+		return false, nil
+	}
+	if fserrors.ShouldRetry(err) {
+		return true, err
+	}
+	// Check for gRPC errors
+	if s, ok := status.FromError(err); ok {
+		if s.Code() == codes.Unavailable {
+			return true, err
+		}
+	}
+	return false, err
 }
