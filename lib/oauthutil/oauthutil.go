@@ -98,6 +98,15 @@ func normalizeAuthCode(raw string) string {
 		s = strings.TrimSpace(s[len("token="):])
 	}
 
+	// Remove all whitespace first, as the token may have been wrapped by the terminal
+	// when pasted. This ensures embedded newlines don't break the base64 blob detection.
+	s = strings.Map(func(r rune) rune {
+		if unicode.IsSpace(r) {
+			return -1
+		}
+		return r
+	}, s)
+
 	// Prefer the longest contiguous base64-ish blob if there is extra surrounding text.
 	re := regexp.MustCompile(`[A-Za-z0-9+/=_-]{20,}`)
 	if matches := re.FindAllString(s, -1); len(matches) > 0 {
