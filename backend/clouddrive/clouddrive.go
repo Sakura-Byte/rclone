@@ -993,7 +993,7 @@ func (f *Fs) shouldRetry(ctx context.Context, err error) (bool, error) {
 	}
 	// Check for gRPC errors
 	if s, ok := status.FromError(err); ok {
-		if s.Code() == codes.Unavailable {
+		if s.Code() == codes.Unavailable || s.Code() == codes.Unimplemented {
 			return true, err
 		}
 	}
