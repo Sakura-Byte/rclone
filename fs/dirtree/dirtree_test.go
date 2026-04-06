@@ -3,7 +3,9 @@ package dirtree
 import (
 	"fmt"
 	"testing"
+	"time"
 
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fstest/mockdir"
 	"github.com/rclone/rclone/fstest/mockobject"
 	"github.com/stretchr/testify/assert"
@@ -60,6 +62,24 @@ dir/subdir/sausage/
 dir/subdir/
   sausage/
 dir/subdir/sausage/
+`, dt.String())
+}
+
+func TestDirTreeAddDirUpsertsDirectory(t *testing.T) {
+	dt := New()
+	placeholder := fs.NewDir("dir", time.Unix(1, 0))
+	real := fs.NewDir("dir", time.Unix(2, 0)).SetItems(3)
+
+	dt.AddDir(placeholder)
+	dt.AddDir(real)
+
+	parent, found := dt.Find("dir")
+	require.Equal(t, "", parent)
+	require.Same(t, real, found)
+	require.Len(t, dt[""], 1)
+	assert.Equal(t, `/
+  dir/
+dir/
 `, dt.String())
 }
 

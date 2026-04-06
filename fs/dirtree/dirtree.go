@@ -29,16 +29,23 @@ func parentDir(entryPath string) string {
 	return dirPath
 }
 
-// Add an entry to the tree
-// it doesn't create parents
+// Add an entry to the tree.
+//
+// Directory entries are kept unique by remote path within their parent
+// directory. It doesn't create parents.
 func (dt DirTree) Add(entry fs.DirEntry) {
 	dirPath := parentDir(entry.Remote())
+	if _, ok := entry.(fs.Directory); ok {
+		dt.upsertDir(dirPath, entry)
+		return
+	}
 	dt[dirPath] = append(dt[dirPath], entry)
 }
 
-// AddDir adds a directory entry to the tree
-// this creates the directory itself if required
-// it doesn't create parents
+// AddDir adds or replaces a directory entry in the tree.
+//
+// This creates the directory itself if required, but it doesn't create
+// parents.
 func (dt DirTree) AddDir(entry fs.DirEntry) {
 	dirPath := entry.Remote()
 	if dirPath == "" {
@@ -49,6 +56,18 @@ func (dt DirTree) AddDir(entry fs.DirEntry) {
 	if _, ok := dt[dirPath]; !ok {
 		dt[dirPath] = nil
 	}
+}
+
+// upsertDir adds the directory entry to the parent directory, replacing an
+// existing directory with the same remote if present.
+func (dt DirTree) upsertDir(parentPath string, entry fs.DirEntry) {
+	for i, existing := range dt[parentPath] {
+		if dir, ok := existing.(fs.Directory); ok && dir.Remote() == entry.Remote() {
+			dt[parentPath][i] = entry
+			return
+		}
+	}
+	dt[parentPath] = append(dt[parentPath], entry)
 }
 
 // AddEntry adds the entry and creates the parents for it regardless
@@ -104,7 +123,7 @@ func (dt DirTree) checkParent(root, dirPath string, dirs map[string]struct{}) {
 				return
 			}
 		}
-		dt[parentPath] = append(dt[parentPath], fs.NewDir(dirPath, time.Now()))
+		dt.AddDir(fs.NewDir(dirPath, time.Now()))
 		if dirs != nil {
 			dirs[dirPath] = struct{}{}
 		}

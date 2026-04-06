@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/fs"
 	_ "github.com/rclone/rclone/fs/accounting"
@@ -743,6 +744,46 @@ b/c/d/
 	}
 	// Set to default value, to avoid side effects
 	fi.Opt.ExcludeFile = nil
+}
+
+func TestWalkRDirTreeReplacesSyntheticDirectory(t *testing.T) {
+	fi, err := filter.NewFilter(nil)
+	require.NoError(t, err)
+	require.NoError(t, fi.Add(false, ".ignore"))
+	ctx := filter.ReplaceConfig(context.Background(), fi)
+
+	realDir := fs.NewDir("a", time.Unix(2, 0)).SetItems(3)
+	r, err := walkRDirTree(ctx, nil, "", false, -1, makeListRCallback(fs.DirEntries{
+		mockobject.Object("a/.ignore"),
+		realDir,
+	}, nil))
+	require.NoError(t, err)
+	assert.Equal(t, `/
+  a/
+a/
+`, r.String())
+
+	parent, entry := r.Find("a")
+	require.Equal(t, "", parent)
+	require.Same(t, realDir, entry)
+}
+
+func TestWalkRDirTreeKeepsRealDirectoryWhenPlaceholderArrivesLater(t *testing.T) {
+	fi, err := filter.NewFilter(nil)
+	require.NoError(t, err)
+	require.NoError(t, fi.Add(false, ".ignore"))
+	ctx := filter.ReplaceConfig(context.Background(), fi)
+
+	realDir := fs.NewDir("a", time.Unix(2, 0)).SetItems(3)
+	r, err := walkRDirTree(ctx, nil, "", false, -1, makeListRCallback(fs.DirEntries{
+		realDir,
+		mockobject.Object("a/.ignore"),
+	}, nil))
+	require.NoError(t, err)
+
+	parent, entry := r.Find("a")
+	require.Equal(t, "", parent)
+	require.Same(t, realDir, entry)
 }
 
 func TestListType(t *testing.T) {
