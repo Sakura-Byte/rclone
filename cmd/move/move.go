@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/sync"
@@ -16,6 +17,7 @@ import (
 var (
 	deleteEmptySrcDirs = false
 	createEmptySrcDirs = false
+	listOrder          = fs.ListOrderDefault
 )
 
 func init() {
@@ -23,6 +25,7 @@ func init() {
 	cmdFlags := commandDefinition.Flags()
 	flags.BoolVarP(cmdFlags, &deleteEmptySrcDirs, "delete-empty-src-dirs", "", deleteEmptySrcDirs, "Delete empty source dirs after move", "")
 	flags.BoolVarP(cmdFlags, &createEmptySrcDirs, "create-empty-src-dirs", "", createEmptySrcDirs, "Create empty source dirs on destination after move", "")
+	flags.StringVarP(cmdFlags, &listOrder, "list-order", "", listOrder, "Set directory listing order: default, reverse, random", "")
 }
 
 var commandDefinition = &cobra.Command{
@@ -75,10 +78,16 @@ for more info.
 		cmd.CheckArgs(2, 2, command, args)
 		fsrc, srcFileName, fdst := cmd.NewFsSrcFileDst(args)
 		cmd.Run(true, true, command, func() error {
-			if srcFileName == "" {
-				return sync.MoveDir(context.Background(), fdst, fsrc, deleteEmptySrcDirs, createEmptySrcDirs)
+			ctx, ci := fs.AddConfig(context.Background())
+			parsedListOrder, err := fs.ParseListOrder(listOrder)
+			if err != nil {
+				return err
 			}
-			return operations.MoveFile(context.Background(), fdst, fsrc, srcFileName, srcFileName)
+			ci.ListOrder = parsedListOrder
+			if srcFileName == "" {
+				return sync.MoveDir(ctx, fdst, fsrc, deleteEmptySrcDirs, createEmptySrcDirs)
+			}
+			return operations.MoveFile(ctx, fdst, fsrc, srcFileName, srcFileName)
 		})
 	},
 }

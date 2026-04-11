@@ -21,12 +21,14 @@ var (
 	createEmptySrcDirs = false
 	opt                = operations.LoggerOpt{}
 	loggerFlagsOpt     = operationsflags.AddLoggerFlagsOptions{}
+	listOrder          = fs.ListOrderDefault
 )
 
 func init() {
 	cmd.Root.AddCommand(commandDefinition)
 	cmdFlags := commandDefinition.Flags()
 	flags.BoolVarP(cmdFlags, &createEmptySrcDirs, "create-empty-src-dirs", "", createEmptySrcDirs, "Create empty source dirs on destination after sync", "")
+	flags.StringVarP(cmdFlags, &listOrder, "list-order", "", listOrder, "Set directory listing order: default, reverse, random", "")
 	operationsflags.AddLoggerFlags(cmdFlags, &opt, &loggerFlagsOpt)
 	// TODO: add same flags to move and copy
 }
@@ -227,7 +229,12 @@ is most useful as a predictor of what SHOULD happen to each file
 		cmd.CheckArgs(2, 2, command, args)
 		fsrc, srcFileName, fdst := cmd.NewFsSrcFileDst(args)
 		cmd.Run(true, true, command, func() error {
-			ctx := context.Background()
+			ctx, ci := fs.AddConfig(context.Background())
+			parsedListOrder, err := fs.ParseListOrder(listOrder)
+			if err != nil {
+				return err
+			}
+			ci.ListOrder = parsedListOrder
 			opt, close, err := GetSyncLoggerOpt(ctx, fdst, command)
 			if err != nil {
 				return err

@@ -4,7 +4,10 @@ package march
 import (
 	"cmp"
 	"context"
+	crand "crypto/rand"
+	"encoding/binary"
 	"fmt"
+	"hash/maphash"
 	"path"
 	"slices"
 	"strings"
@@ -42,9 +45,47 @@ type March struct {
 	NoCheckDest            bool            // transfer all objects regardless without checking dst
 	NoUnicodeNormalization bool            // don't normalize unicode characters in filenames
 	// internal state
-	srcListDir listDirFn // function to call to list a directory in the src
-	dstListDir listDirFn // function to call to list a directory in the dst
-	transforms []matchTransformFn
+	srcListDir          listDirFn // function to call to list a directory in the src
+	dstListDir          listDirFn // function to call to list a directory in the dst
+	transforms          []matchTransformFn
+	listOrder           string
+	listOrderRandomSeed uint64
+	listOrderHashSeed   *maphash.Seed
+}
+
+func newListOrderRandomSeed() uint64 {
+	var seed [8]byte
+	if _, err := crand.Read(seed[:]); err == nil {
+		return binary.BigEndian.Uint64(seed[:])
+	}
+	return 1
+}
+
+func reverseListOrderKey(key string) string {
+	buf := make([]byte, len(key)+1)
+	for i := 0; i < len(key); i++ {
+		buf[i] = ^key[i]
+	}
+	buf[len(key)] = 0xFF
+	return string(buf)
+}
+
+func randomListOrderKey(hashSeed *maphash.Seed, runSeed uint64, key string) string {
+	var prefix [8]byte
+	sum := maphash.String(*hashSeed, key) ^ runSeed
+	binary.BigEndian.PutUint64(prefix[:], sum)
+	return string(prefix[:]) + key
+}
+
+func (m *March) applyListOrder(key string) string {
+	switch m.listOrder {
+	case fs.ListOrderReverse:
+		return reverseListOrderKey(key)
+	case fs.ListOrderRandom:
+		return randomListOrderKey(m.listOrderHashSeed, m.listOrderRandomSeed, key)
+	default:
+		return key
+	}
 }
 
 // Marcher is called on each match
@@ -79,6 +120,23 @@ func (m *March) init(ctx context.Context) {
 	if m.Fdst.Features().CaseInsensitive || ci.IgnoreCaseSync {
 		m.transforms = append(m.transforms, strings.ToLower)
 	}
+	listOrder, err := fs.ParseListOrder(ci.ListOrder)
+	if err != nil {
+		fs.Errorf(nil, "%v", err)
+		listOrder = fs.ListOrderDefault
+	}
+	m.listOrder = listOrder
+	if m.listOrder == fs.ListOrderRandom {
+		m.listOrderRandomSeed = ci.ListOrderRandomSeed
+		if m.listOrderRandomSeed == 0 {
+			m.listOrderRandomSeed = newListOrderRandomSeed()
+		}
+		m.listOrderHashSeed = ci.ListOrderHashSeed
+		if m.listOrderHashSeed == nil {
+			seed := maphash.MakeSeed()
+			m.listOrderHashSeed = &seed
+		}
+	}
 }
 
 // srcOrDstKey turns a directory entry into a sort key using the defined transforms.
@@ -101,7 +159,7 @@ func (m *March) srcOrDstKey(entry fs.DirEntry, isSrc bool) string {
 	} else {
 		name += "F"
 	}
-	return name
+	return m.applyListOrder(name)
 }
 
 // srcKey turns a directory entry into a sort key using the defined transforms.

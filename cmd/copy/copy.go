@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/rclone/rclone/cmd"
+	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/flags"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/fs/sync"
@@ -14,12 +15,14 @@ import (
 
 var (
 	createEmptySrcDirs = false
+	listOrder          = fs.ListOrderDefault
 )
 
 func init() {
 	cmd.Root.AddCommand(commandDefinition)
 	cmdFlags := commandDefinition.Flags()
 	flags.BoolVarP(cmdFlags, &createEmptySrcDirs, "create-empty-src-dirs", "", createEmptySrcDirs, "Create empty source dirs on destination after copy", "")
+	flags.StringVarP(cmdFlags, &listOrder, "list-order", "", listOrder, "Set directory listing order: default, reverse, random", "")
 }
 
 var commandDefinition = &cobra.Command{
@@ -103,10 +106,16 @@ for more info.
 			srcFileName = fsrc.Root()[7:]
 		}
 		cmd.Run(true, true, command, func() error {
-			if srcFileName == "" {
-				return sync.CopyDir(context.Background(), fdst, fsrc, createEmptySrcDirs)
+			ctx, ci := fs.AddConfig(context.Background())
+			parsedListOrder, err := fs.ParseListOrder(listOrder)
+			if err != nil {
+				return err
 			}
-			return operations.CopyFile(context.Background(), fdst, fsrc, srcFileName, srcFileName)
+			ci.ListOrder = parsedListOrder
+			if srcFileName == "" {
+				return sync.CopyDir(ctx, fdst, fsrc, createEmptySrcDirs)
+			}
+			return operations.CopyFile(ctx, fdst, fsrc, srcFileName, srcFileName)
 		})
 	},
 }

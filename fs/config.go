@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"net"
 	"os"
 	"strconv"
@@ -645,6 +646,9 @@ type ConfigInfo struct {
 	MultiThreadChunkSize       SizeSuffix        `config:"multi_thread_chunk_size"` // Chunk size for multi-thread downloads / uploads, if not set by filesystem
 	MultiThreadWriteBufferSize SizeSuffix        `config:"multi_thread_write_buffer_size"`
 	OrderBy                    string            `config:"order_by"` // instructions on how to order the transfer
+	ListOrder                  string            `config:"-"`
+	ListOrderRandomSeed        uint64            `config:"-"`
+	ListOrderHashSeed          *maphash.Seed     `config:"-"`
 	UploadHeaders              []*HTTPOption     `config:"upload_headers"`
 	DownloadHeaders            []*HTTPOption     `config:"download_headers"`
 	Headers                    []*HTTPOption     `config:"headers"`

@@ -7,10 +7,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
 	"io"
 	"os"
 	"os/exec"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -3071,4 +3073,72 @@ func testLoggerVsLsf(ctx context.Context, fdst, fsrc fs.Fs, logger *bytes.Buffer
 		err := LoggerMatchesLsf(&newlogger, lsf)
 		require.NoError(t, err)
 	}
+}
+
+var listOrderTestFiles = []string{"a", "aa", "ab", "b", "ba", "bb", "c", "ca"}
+
+func captureMissingOnDstOrder(ctx context.Context, order *[]string) context.Context {
+	opt := operations.NewLoggerOpt()
+	var lock mutex.Mutex
+
+	opt.LoggerFn = func(ctx context.Context, sigil operations.Sigil, src, dst fs.DirEntry, err error) {
+		if sigil != operations.MissingOnDst || err == fs.ErrorIsDir {
+			return
+		}
+		srcObj, ok := src.(fs.Object)
+		if !ok {
+			return
+		}
+		lock.Lock()
+		*order = append(*order, srcObj.Remote())
+		lock.Unlock()
+	}
+
+	return operations.WithSyncLogger(ctx, opt)
+}
+
+func syncOrderForListOrder(t *testing.T, listOrder string, randomSeed uint64, hashSeed *maphash.Seed) []string {
+	t.Helper()
+
+	r := fstest.NewRunIndividual(t)
+	for _, file := range listOrderTestFiles {
+		r.WriteFile(file, file, t1)
+	}
+
+	ctx, ci := fs.AddConfig(context.Background())
+	ci.Checkers = 1
+	ci.Transfers = 1
+	ci.ListOrder = listOrder
+	ci.ListOrderRandomSeed = randomSeed
+	ci.ListOrderHashSeed = hashSeed
+
+	var got []string
+	ctx = captureMissingOnDstOrder(ctx, &got)
+	require.NoError(t, Sync(ctx, r.Fremote, r.Flocal, false))
+	return got
+}
+
+func TestSyncListOrderReverse(t *testing.T) {
+	got := syncOrderForListOrder(t, fs.ListOrderReverse, 0, nil)
+
+	expected := append([]string(nil), listOrderTestFiles...)
+	sort.Strings(expected)
+	slices.Reverse(expected)
+
+	assert.Equal(t, expected, got)
+}
+
+func TestSyncListOrderRandomStable(t *testing.T) {
+	hashSeed := maphash.MakeSeed()
+	randomSeed := uint64(0x1234567890abcdef)
+
+	got1 := syncOrderForListOrder(t, fs.ListOrderRandom, randomSeed, &hashSeed)
+	got2 := syncOrderForListOrder(t, fs.ListOrderRandom, randomSeed, &hashSeed)
+
+	expected := append([]string(nil), listOrderTestFiles...)
+	sort.Strings(expected)
+
+	assert.Equal(t, got1, got2)
+	assert.ElementsMatch(t, expected, got1)
+	assert.NotEqual(t, expected, got1)
 }

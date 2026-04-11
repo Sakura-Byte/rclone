@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/maphash"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -553,5 +555,100 @@ func TestMatchListings(t *testing.T) {
 			assert.Equal(t, test.dstOnly, dstOnly, test.what, "dstOnly differ")
 			assert.Equal(t, test.matches, matches, test.what, "matches differ")
 		})
+	}
+}
+
+func sortStringsByKey(keys []string, keyFn func(string) string) []string {
+	sortedKeys := append([]string(nil), keys...)
+	sort.SliceStable(sortedKeys, func(i, j int) bool {
+		return keyFn(sortedKeys[i]) < keyFn(sortedKeys[j])
+	})
+	return sortedKeys
+}
+
+func dirEntryRemotes(entries fs.DirEntries) []string {
+	remotes := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		remotes = append(remotes, entry.Remote())
+	}
+	return remotes
+}
+
+func TestReverseListOrderKeyPrefix(t *testing.T) {
+	keys := []string{"a", "aa", "ab", "b"}
+	got := sortStringsByKey(keys, reverseListOrderKey)
+	assert.Equal(t, []string{"b", "ab", "aa", "a"}, got)
+}
+
+func TestRandomListOrderKeyStable(t *testing.T) {
+	hashSeed := maphash.MakeSeed()
+	runSeed := uint64(0xdecafbad12345678)
+	keys := []string{"a", "aa", "ab", "b", "ba", "bb", "c", "ca"}
+
+	got1 := sortStringsByKey(keys, func(key string) string {
+		return randomListOrderKey(&hashSeed, runSeed, key)
+	})
+	got2 := sortStringsByKey(keys, func(key string) string {
+		return randomListOrderKey(&hashSeed, runSeed, key)
+	})
+
+	assert.Equal(t, got1, got2)
+	assert.NotEqual(t, sortStringsByKey(keys, func(key string) string { return key }), got1)
+}
+
+func TestMarchListOrder(t *testing.T) {
+	files := []string{"a", "aa", "ab", "b", "ba", "bb", "c", "ca"}
+
+	for _, listOrder := range []string{fs.ListOrderDefault, fs.ListOrderReverse, fs.ListOrderRandom} {
+		for _, fastList := range []bool{false, true} {
+			for _, noTraverse := range []bool{false, true} {
+				testName := fmt.Sprintf("order=%s/fast-list=%v/no-traverse=%v", listOrder, fastList, noTraverse)
+				t.Run(testName, func(t *testing.T) {
+					r := fstest.NewRun(t)
+					for _, file := range files {
+						r.WriteFile(file, file, t1)
+					}
+
+					ctx, ci := fs.AddConfig(context.Background())
+					runCtx, cancel := context.WithCancel(ctx)
+					defer cancel()
+
+					ci.UseListR = fastList
+					ci.ListOrder = listOrder
+					ci.ListOrderRandomSeed = 0x1234567890abcdef
+					hashSeed := maphash.MakeSeed()
+					ci.ListOrderHashSeed = &hashSeed
+
+					if fastList && r.Flocal.Features().ListR == nil {
+						r.Flocal.Features().ListR = func(ctx context.Context, dir string, callback fs.ListRCallback) error {
+							r.Flocal.Features().ListR = nil
+							return walk.ListR(ctx, r.Flocal, dir, true, -1, walk.ListAll, callback)
+						}
+						defer func() {
+							r.Flocal.Features().ListR = nil
+						}()
+					}
+
+					mt := &marchTester{
+						ctx:        runCtx,
+						cancel:     cancel,
+						noTraverse: noTraverse,
+					}
+					m := &March{
+						Ctx:        runCtx,
+						Fdst:       r.Fremote,
+						Fsrc:       r.Flocal,
+						Dir:        "",
+						NoTraverse: noTraverse,
+						Callback:   mt,
+					}
+
+					require.NoError(t, m.Run(runCtx))
+					assert.Equal(t, sortStringsByKey(files, func(key string) string {
+						return m.applyListOrder(key + "F")
+					}), dirEntryRemotes(mt.srcOnly))
+				})
+			}
+		}
 	}
 }
