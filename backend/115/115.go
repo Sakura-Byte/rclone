@@ -211,6 +211,11 @@ Minimum is 100 KiB, maximum is 5 GiB.`,
 			Advanced: true,
 			Help:     "Skip disk buffering for uploads.",
 		}, {
+			Name:     "prefetch",
+			Default:  false,
+			Advanced: true,
+			Help:     "Prefetch download URLs for files queued for transfer.",
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -281,6 +286,7 @@ type Options struct {
 	DualStack           bool                 `config:"dual_stack"`
 	NoCheck             bool                 `config:"no_check"`
 	NoBuffer            bool                 `config:"no_buffer"` // Skip disk buffering for uploads
+	Prefetch            bool                 `config:"prefetch"`
 	Enc                 encoder.MultiEncoder `config:"encoding"`
 	AppID               string               `config:"app_id"` // Custom App ID for authentication
 }
@@ -2728,6 +2734,25 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 	// Open the URL
 	return o.open(ctx, options...)
+}
+
+// PrefetchDownloadLink fetches and caches a download URL before Open is called.
+func (o *Object) PrefetchDownloadLink(ctx context.Context) error {
+	if !o.fs.opt.Prefetch {
+		return nil
+	}
+	err := o.readMetaData(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to read metadata before prefetching download URL: %w", err)
+	}
+	if o.size == 0 {
+		return nil
+	}
+	err = o.setDownloadURL(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to prefetch download URL: %w", err)
+	}
+	return nil
 }
 
 // Update the object with new content.

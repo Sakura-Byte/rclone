@@ -365,6 +365,15 @@ func (s *syncCopyMove) currentError() error {
 	return s.noRetryErr
 }
 
+// queueForTransfer queues pair for transfer and gives backends a chance to do
+// transfer preparation while the object is still waiting in the backlog.
+func (s *syncCopyMove) queueForTransfer(out *pipe, pair fs.ObjectPair) bool {
+	if pair.Src != pair.Dst {
+		operations.PrefetchDownloadLink(s.inCtx, pair.Src)
+	}
+	return out.Put(s.inCtx, pair)
+}
+
 // pairChecker reads Objects~s on in send to out if they need transferring.
 //
 // FIXME potentially doing lots of hashes at once
@@ -422,13 +431,13 @@ func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, fraction int, wg *sync.W
 						} else {
 							// If successful zero out the dst as it is no longer there and copy the file
 							pair.Dst = nil
-							ok = out.Put(s.inCtx, pair)
+							ok = s.queueForTransfer(out, pair)
 							if !ok {
 								return
 							}
 						}
 					} else {
-						ok = out.Put(s.inCtx, pair)
+						ok = s.queueForTransfer(out, pair)
 						if !ok {
 							return
 						}
@@ -446,7 +455,7 @@ func (s *syncCopyMove) pairChecker(in *pipe, out *pipe, fraction int, wg *sync.W
 						// If we want perfect ordering then use the transfers to delete the file
 						//
 						// We send src == dst, to say we want the src deleted
-						ok = out.Put(s.inCtx, fs.ObjectPair{Src: src, Dst: src})
+						ok = s.queueForTransfer(out, fs.ObjectPair{Src: src, Dst: src})
 						if !ok {
 							return
 						}
@@ -475,7 +484,7 @@ func (s *syncCopyMove) pairRenamer(in *pipe, out *pipe, fraction int, wg *sync.W
 		if !s.tryRename(src) {
 			// pass on if not renamed
 			fs.Debugf(src, "Need to transfer - No matching file found at Destination")
-			ok = out.Put(s.inCtx, pair)
+			ok = s.queueForTransfer(out, pair)
 			if !ok {
 				return
 			}
@@ -1248,7 +1257,7 @@ func (s *syncCopyMove) SrcOnly(src fs.DirEntry) (recurse bool) {
 				// No need to check since doesn't exist
 				fs.Debugf(src, "Need to transfer - File not found at Destination")
 				s.markDirModifiedObject(x)
-				ok := s.toBeUploaded.Put(s.inCtx, fs.ObjectPair{Src: x, Dst: nil})
+				ok := s.queueForTransfer(s.toBeUploaded, fs.ObjectPair{Src: x, Dst: nil})
 				if !ok {
 					return
 				}

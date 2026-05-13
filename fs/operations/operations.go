@@ -423,6 +423,26 @@ func MoveTransfer(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string,
 	return move(ctx, fdst, dst, remote, src, true)
 }
 
+// DownloadLinkPrefetcher is implemented by source objects that can prepare a
+// download link before Open is called.
+type DownloadLinkPrefetcher interface {
+	PrefetchDownloadLink(ctx context.Context) error
+}
+
+// PrefetchDownloadLink asks the backend to prepare a download link for src.
+//
+// Prefetch failures are logged only: Open will still retry the normal path when
+// the transfer starts.
+func PrefetchDownloadLink(ctx context.Context, src fs.Object) {
+	prefetcher, ok := src.(DownloadLinkPrefetcher)
+	if !ok {
+		return
+	}
+	if err := prefetcher.PrefetchDownloadLink(ctx); err != nil {
+		fs.Debugf(src, "Failed to prefetch download link: %v", err)
+	}
+}
+
 // move - see Move for help
 func move(ctx context.Context, fdst fs.Fs, dst fs.Object, remote string, src fs.Object, isTransfer bool) (newDst fs.Object, err error) {
 	origRemote := remote // avoid double-transform on fallback to copy

@@ -410,6 +410,7 @@ func Copy(ctx context.Context, f fs.Fs, dst fs.Object, remote string, src fs.Obj
 		return nil, err
 	}
 	// Do the copy now everything is set up
+	PrefetchDownloadLink(ctx, src)
 	return c.copy(ctx)
 }
 
