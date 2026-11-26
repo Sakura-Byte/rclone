@@ -21,6 +21,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type encodingClient struct {
@@ -159,4 +161,160 @@ func TestCopyPreservesLiteralSlash(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, files, 1)
 	assert.False(t, files[0].IsDir())
+}
+
+// opClient records the CloudDrive operations a backend call makes.
+type opClient struct {
+	api.CloudDriveFileSrvClient
+	calls     []string
+	existing  map[string]bool
+	renameErr string
+}
+
+func (c *opClient) RenameFile(_ context.Context, req *api.RenameFileRequest, _ ...grpc.CallOption) (*api.FileOperationResult, error) {
+	c.calls = append(c.calls, "rename "+req.TheFilePath+" -> "+req.NewName)
+	if c.renameErr != "" {
+		return &api.FileOperationResult{Success: false, ErrorMessage: c.renameErr}, nil
+	}
+	parent, _ := splitFull(req.TheFilePath)
+	delete(c.existing, req.TheFilePath)
+	c.existing[joinFull(parent, req.NewName)] = true
+	return &api.FileOperationResult{Success: true}, nil
+}
+
+func (c *opClient) MoveFile(_ context.Context, req *api.MoveFileRequest, _ ...grpc.CallOption) (*api.FileOperationResult, error) {
+	c.calls = append(c.calls, "move "+req.TheFilePaths[0]+" -> "+req.DestPath+" "+req.GetConflictPolicy().String())
+	for _, p := range req.TheFilePaths {
+		_, leaf := splitFull(p)
+		delete(c.existing, p)
+		c.existing[joinFull(req.DestPath, leaf)] = true
+	}
+	return &api.FileOperationResult{Success: true}, nil
+}
+
+func (c *opClient) CopyFile(_ context.Context, req *api.CopyFileRequest, _ ...grpc.CallOption) (*api.FileOperationResult, error) {
+	c.calls = append(c.calls, "copy "+req.TheFilePaths[0]+" -> "+req.DestPath+" "+req.GetConflictPolicy().String())
+	_, leaf := splitFull(req.TheFilePaths[0])
+	c.existing[joinFull(req.DestPath, leaf)] = true
+	return &api.FileOperationResult{Success: true}, nil
+}
+
+func (c *opClient) DeleteFile(_ context.Context, req *api.FileRequest, _ ...grpc.CallOption) (*api.FileOperationResult, error) {
+	c.calls = append(c.calls, "delete "+req.Path)
+	delete(c.existing, req.Path)
+	return &api.FileOperationResult{Success: true}, nil
+}
+
+func (c *opClient) FindFileByPath(_ context.Context, req *api.FindFileByPathRequest, _ ...grpc.CallOption) (*api.CloudDriveFile, error) {
+	p := joinFull(req.ParentPath, req.Path)
+	if !c.existing[p] {
+		return nil, status.Error(codes.NotFound, "not found")
+	}
+	return &api.CloudDriveFile{Name: req.Path, FullPathName: p, FileType: api.CloudDriveFile_File}, nil
+}
+
+func newOpTestFs(t *testing.T, existing ...string) (*Fs, *opClient) {
+	f := newEncodingTestFs(t)
+	f.root = "rec"
+	c := &opClient{existing: map[string]bool{}}
+	for _, p := range existing {
+		c.existing[p] = true
+	}
+	f.client = c
+	return f, c
+}
+
+func TestMoveSameDirFailedRenameDoesNotMove(t *testing.T) {
+	f, c := newOpTestFs(t, "/rec/a/old.m4a")
+	c.renameErr = "boom"
+	src := &Object{fs: f, remote: "a/old.m4a"}
+	_, err := f.Move(context.Background(), src, "a/new.m4a")
+	require.Error(t, err)
+	// Falling back to MoveFile into the same directory makes CloudDrive
+	// rename the file to "old(1).m4a".
+	assert.Equal(t, []string{"rename /rec/a/old.m4a -> new.m4a"}, c.calls)
+}
+
+func TestMoveSameDirLiteralFullwidthSlash(t *testing.T) {
+	f, c := newOpTestFs(t, "/rec/a/x／old.m4a")
+	src := &Object{fs: f, remote: encoder.EncodeRaw.ToStandardPath("a/x／old.m4a")}
+	_, err := f.Move(context.Background(), src, encoder.EncodeRaw.ToStandardPath("a/x／new.m4a"))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"rename /rec/a/x／old.m4a -> x／new.m4a"}, c.calls)
+}
+
+func TestMoveRejectsRealSlash(t *testing.T) {
+	f, c := newOpTestFs(t, "/rec/a/x／old.m4a")
+	src := &Object{fs: f, remote: encoder.EncodeRaw.ToStandardPath("a/x／old.m4a")}
+	// An unquoted "／" in an rclone name stands for "/", which CloudDrive
+	// would turn into a directory level.
+	_, err := f.Move(context.Background(), src, "a/x／new.m4a")
+	require.Error(t, err)
+	assert.Empty(t, c.calls)
+}
+
+func TestMoveAcrossDirsRenamesFirst(t *testing.T) {
+	// "b/old.m4a" is an unrelated file: the old code moved with the Rename
+	// policy (creating "old(1).m4a") and then renamed this one.
+	f, c := newOpTestFs(t, "/rec/a/old.m4a", "/rec/b/old.m4a")
+	src := &Object{fs: f, remote: "a/old.m4a"}
+	_, err := f.Move(context.Background(), src, "b/new.m4a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"rename /rec/a/old.m4a -> new.m4a",
+		"move /rec/a/new.m4a -> /rec/b Overwrite",
+	}, c.calls)
+	assert.True(t, c.existing["/rec/b/old.m4a"])
+	assert.True(t, c.existing["/rec/b/new.m4a"])
+}
+
+func TestMoveUsesSourceFsRoot(t *testing.T) {
+	f, c := newOpTestFs(t, "/other/x.m4a")
+	srcFs := *f
+	srcFs.root = "other"
+	src := &Object{fs: &srcFs, remote: "x.m4a"}
+	_, err := f.Move(context.Background(), src, "x.m4a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"move /other/x.m4a -> /rec Overwrite"}, c.calls)
+}
+
+func TestDirMoveRenamesInPlace(t *testing.T) {
+	f, c := newOpTestFs(t, "/rec/a/old")
+	require.NoError(t, f.DirMove(context.Background(), f, "a/old", "a/new"))
+	assert.Equal(t, []string{"rename /rec/a/old -> new"}, c.calls)
+}
+
+func TestDirMoveAcrossDirs(t *testing.T) {
+	f, c := newOpTestFs(t, "/rec/a/old", "/rec/b")
+	require.NoError(t, f.DirMove(context.Background(), f, "a/old", "b/new"))
+	assert.Equal(t, []string{
+		"rename /rec/a/old -> new",
+		"move /rec/a/new -> /rec/b Skip",
+	}, c.calls)
+}
+
+func TestDirMoveExisting(t *testing.T) {
+	f, c := newOpTestFs(t, "/rec/a/old", "/rec/a/new")
+	assert.ErrorIs(t, f.DirMove(context.Background(), f, "a/old", "a/new"), fs.ErrorDirExists)
+	assert.Empty(t, c.calls)
+}
+
+func TestCopyNewLeaf(t *testing.T) {
+	f, c := newOpTestFs(t, "/rec/a/old.m4a", "/rec/b/new.m4a")
+	src := &Object{fs: f, remote: "a/old.m4a"}
+	_, err := f.Copy(context.Background(), src, "b/new.m4a")
+	require.NoError(t, err)
+	assert.Equal(t, []string{
+		"copy /rec/a/old.m4a -> /rec/b Skip",
+		"delete /rec/b/new.m4a",
+		"rename /rec/b/old.m4a -> new.m4a",
+	}, c.calls)
+}
+
+func TestCopyNewLeafClash(t *testing.T) {
+	f, c := newOpTestFs(t, "/rec/a/old.m4a", "/rec/b/old.m4a")
+	src := &Object{fs: f, remote: "a/old.m4a"}
+	_, err := f.Copy(context.Background(), src, "b/new.m4a")
+	assert.ErrorIs(t, err, fs.ErrorCantCopy)
+	assert.Empty(t, c.calls)
 }

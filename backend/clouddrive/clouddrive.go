@@ -189,10 +189,22 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	features.Copy = f.Copy
 	f.features = features
 
-	// Verify root exists if not empty
+	// If the root is a file, point the Fs at its parent and say so, as
+	// rclone expects. Otherwise "moveto"/"copyto" of a single file is
+	// treated as a directory operation.
 	if f.root != "" {
-		if _, err := f.statPath(ctx, ""); err != nil && !errors.Is(err, fs.ErrorDirNotFound) {
-			fs.Debugf(f, "ignoring root lookup error: %v", err)
+		item, err := f.statPath(ctx, "")
+		if err != nil {
+			if !errors.Is(err, fs.ErrorDirNotFound) && !errors.Is(err, fs.ErrorObjectNotFound) {
+				fs.Debugf(f, "ignoring root lookup error: %v", err)
+			}
+		} else if item != nil && !item.GetIsDirectory() && item.GetFileType() != api.CloudDriveFile_Directory {
+			newRoot := path.Dir(f.root)
+			if newRoot == "." {
+				newRoot = ""
+			}
+			f.root = newRoot
+			return f, fs.ErrorIsFile
 		}
 	}
 
@@ -401,6 +413,9 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 
 // Mkdir creates a directory
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+	if err := f.checkPath(dir); err != nil {
+		return err
+	}
 	ctx = f.withAuth(ctx)
 	p := f.fullPath(dir)
 	parent, leaf := path.Split(p)
@@ -526,6 +541,9 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
 func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
 	ctx = f.withAuth(ctx)
 	remote := src.Remote()
+	if err := f.checkPath(remote); err != nil {
+		return err
+	}
 	p := f.fullPath(remote)
 	parentPath, fileName := path.Split(p)
 	if parentPath == "" {
@@ -621,76 +639,196 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	return nil
 }
 
-// Move moves a single object
-func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
-	dstParent, dstLeaf := path.Split(remote)
-	srcParent := path.Dir(src.Remote())
-
-	if srcParent == strings.Trim(dstParent, "/") {
-		// rename in place
-		if err := f.rename(ctx, src.Remote(), dstLeaf); err == nil {
-			return f.NewObject(ctx, remote)
+// checkPath rejects remote paths that CloudDrive cannot store.
+//
+// CloudDrive paths use "/" as the separator, so a name that decodes to
+// contain "/" would silently become an extra directory level. In rclone
+// names a real fullwidth slash is written "‛／"; an unquoted "／" stands
+// for "/".
+func (f *Fs) checkPath(remote string) error {
+	for _, part := range strings.Split(strings.Trim(remote, "/"), "/") {
+		if strings.Contains(f.opt.Enc.FromStandardName(part), "/") {
+			return fmt.Errorf("clouddrive: %q: name contains \"/\" which CloudDrive cannot store", remote)
 		}
 	}
-
-	if err := f.moveFile(ctx, []string{src.Remote()}, dstParent); err != nil {
-		return nil, err
-	}
-	if dstLeaf != path.Base(src.Remote()) {
-		if err := f.rename(ctx, path.Join(dstParent, path.Base(src.Remote())), dstLeaf); err != nil {
-			return nil, err
-		}
-	}
-	return f.NewObject(ctx, remote)
+	return nil
 }
 
-// DirMove moves a directory tree
-func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
-	if f != src {
-		return fs.ErrorCantDirMove
-	}
-	return f.moveFile(ctx, []string{srcRemote}, dstRemote)
+// sameServer reports whether o talks to the same CloudDrive server as f,
+// so server-side operations between them are possible.
+func (f *Fs) sameServer(o *Fs) bool {
+	return o != nil && f.opt.Server == o.opt.Server && f.token == o.token
 }
 
-// Copy copies a single object
-func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+// splitFull splits an absolute API path into its parent and leaf.
+func splitFull(p string) (parent, leaf string) {
+	parent, leaf = path.Split(strings.TrimSuffix(p, "/"))
+	if parent != "/" {
+		parent = strings.TrimSuffix(parent, "/")
+	}
+	if parent == "" {
+		parent = "/"
+	}
+	return parent, leaf
+}
+
+// joinFull joins an absolute API directory and a leaf name.
+func joinFull(parent, leaf string) string {
+	if parent == "/" {
+		return "/" + leaf
+	}
+	return parent + "/" + leaf
+}
+
+// findFull looks up an absolute API path.
+func (f *Fs) findFull(ctx context.Context, p string) (item *api.CloudDriveFile, err error) {
 	ctx = f.withAuth(ctx)
-	destDir, _ := path.Split(remote)
-	err := f.pacer.Call(func() (bool, error) {
-		req := &api.CopyFileRequest{
-			TheFilePaths:   []string{f.fullPath(src.Remote())},
-			DestPath:       f.fullPath(strings.TrimSuffix(destDir, "/")),
-			ConflictPolicy: api.CopyFileRequest_Rename.Enum(),
-		}
-		res, err := f.client.CopyFile(ctx, req)
+	parent, leaf := splitFull(p)
+	err = f.pacer.Call(func() (bool, error) {
+		item, err = f.client.FindFileByPath(ctx, &api.FindFileByPathRequest{ParentPath: parent, Path: leaf})
 		if err != nil {
 			return f.shouldRetry(ctx, err)
-		}
-		if !res.GetSuccess() {
-			return false, errors.New(res.GetErrorMessage())
 		}
 		return false, nil
 	})
 	if err != nil {
 		return nil, translateError(err)
 	}
+	return item, nil
+}
+
+// Move moves a single object
+func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok || !f.sameServer(srcObj.fs) {
+		return nil, fs.ErrorCantMove
+	}
+	if err := f.checkPath(remote); err != nil {
+		return nil, err
+	}
+	if err := f.moveFull(ctx, srcObj.fs.fullPath(srcObj.remote), f.fullPath(remote), false); err != nil {
+		return nil, err
+	}
 	return f.NewObject(ctx, remote)
 }
 
-// moveFile moves files or folders to destination directory.
-func (f *Fs) moveFile(ctx context.Context, remotes []string, dstDir string) error {
-	ctx = f.withAuth(ctx)
-	paths := make([]string, 0, len(remotes))
-	for _, r := range remotes {
-		paths = append(paths, f.fullPath(r))
-	}
-	err := f.pacer.Call(func() (bool, error) {
-		req := &api.MoveFileRequest{
-			TheFilePaths:   paths,
-			DestPath:       f.fullPath(strings.Trim(dstDir, "/")),
-			ConflictPolicy: api.MoveFileRequest_Rename.Enum(),
+// moveFull moves or renames one file or directory between absolute API paths.
+//
+// Within one directory this is a single RenameFile; a failed rename is
+// returned rather than retried as a move into the same directory, which
+// CloudDrive would resolve by renaming the file to "name(1)". Across
+// directories the item is first renamed in place to the destination leaf,
+// so MoveFile never has to resolve a clash with the source name and the
+// follow-up rename can never hit an unrelated file.
+func (f *Fs) moveFull(ctx context.Context, srcFull, dstFull string, isDir bool) error {
+	srcParent, srcLeaf := splitFull(srcFull)
+	dstParent, dstLeaf := splitFull(dstFull)
+	if srcParent == dstParent {
+		if srcLeaf == dstLeaf {
+			return nil
 		}
-		res, err := f.client.MoveFile(ctx, req)
+		return f.renameFull(ctx, srcFull, dstLeaf)
+	}
+	cur := srcFull
+	if srcLeaf != dstLeaf {
+		if err := f.renameFull(ctx, srcFull, dstLeaf); err != nil {
+			return err
+		}
+		cur = joinFull(srcParent, dstLeaf)
+	}
+	policy := api.MoveFileRequest_Overwrite
+	if isDir {
+		policy = api.MoveFileRequest_Skip
+	}
+	err := f.moveFiles(ctx, []string{cur}, dstParent, policy)
+	if err == nil && isDir {
+		if _, findErr := f.findFull(ctx, dstFull); findErr != nil {
+			err = fmt.Errorf("clouddrive: directory move to %q did not happen: %w", dstFull, findErr)
+		}
+	}
+	if err != nil && cur != srcFull {
+		if undoErr := f.renameFull(ctx, cur, srcLeaf); undoErr != nil {
+			fs.Errorf(cur, "failed to restore name %q after failed move: %v", srcLeaf, undoErr)
+		}
+	}
+	return err
+}
+
+// DirMove moves a directory tree
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	srcFs, ok := src.(*Fs)
+	if !ok || !f.sameServer(srcFs) {
+		return fs.ErrorCantDirMove
+	}
+	if err := f.checkPath(dstRemote); err != nil {
+		return err
+	}
+	srcFull, dstFull := srcFs.fullPath(srcRemote), f.fullPath(dstRemote)
+	if srcFull == "/" || dstFull == "/" {
+		return fs.ErrorCantDirMove
+	}
+	if _, err := f.findFull(ctx, dstFull); err == nil {
+		return fs.ErrorDirExists
+	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return err
+	}
+	return f.moveFull(ctx, srcFull, dstFull, true)
+}
+
+// Copy copies a single object
+func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object, error) {
+	srcObj, ok := src.(*Object)
+	if !ok || !f.sameServer(srcObj.fs) {
+		return nil, fs.ErrorCantCopy
+	}
+	if err := f.checkPath(remote); err != nil {
+		return nil, err
+	}
+	srcFull, dstFull := srcObj.fs.fullPath(srcObj.remote), f.fullPath(remote)
+	srcParent, srcLeaf := splitFull(srcFull)
+	dstParent, dstLeaf := splitFull(dstFull)
+	if srcParent == dstParent && srcLeaf == dstLeaf {
+		return nil, fs.ErrorCantCopy
+	}
+	if srcLeaf == dstLeaf {
+		if err := f.copyFiles(ctx, srcFull, dstParent, api.CopyFileRequest_Overwrite); err != nil {
+			return nil, err
+		}
+		return f.NewObject(ctx, remote)
+	}
+	// CopyFile keeps the source name. Only copy under that name when the
+	// destination directory has no such entry, then rename it.
+	tmp := joinFull(dstParent, srcLeaf)
+	if _, err := f.findFull(ctx, tmp); err == nil {
+		return nil, fs.ErrorCantCopy
+	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, err
+	}
+	if err := f.copyFiles(ctx, srcFull, dstParent, api.CopyFileRequest_Skip); err != nil {
+		return nil, err
+	}
+	if _, err := f.findFull(ctx, dstFull); err == nil {
+		if err := f.deleteFull(ctx, dstFull); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(err, fs.ErrorObjectNotFound) {
+		return nil, err
+	}
+	if err := f.renameFull(ctx, tmp, dstLeaf); err != nil {
+		return nil, err
+	}
+	return f.NewObject(ctx, remote)
+}
+
+// copyFiles copies one item into an absolute API directory.
+func (f *Fs) copyFiles(ctx context.Context, srcFull, dstDir string, policy api.CopyFileRequest_ConflictPolicy) error {
+	ctx = f.withAuth(ctx)
+	err := f.pacer.Call(func() (bool, error) {
+		res, err := f.client.CopyFile(ctx, &api.CopyFileRequest{
+			TheFilePaths:   []string{srcFull},
+			DestPath:       dstDir,
+			ConflictPolicy: policy.Enum(),
+		})
 		if err != nil {
 			return f.shouldRetry(ctx, err)
 		}
@@ -699,21 +837,58 @@ func (f *Fs) moveFile(ctx context.Context, remotes []string, dstDir string) erro
 		}
 		return false, nil
 	})
-	if err != nil {
-		return translateError(err)
-	}
-	return nil
+	return translateError(err)
+}
+
+// moveFiles moves items into an absolute API directory.
+func (f *Fs) moveFiles(ctx context.Context, fulls []string, dstDir string, policy api.MoveFileRequest_ConflictPolicy) error {
+	ctx = f.withAuth(ctx)
+	err := f.pacer.Call(func() (bool, error) {
+		res, err := f.client.MoveFile(ctx, &api.MoveFileRequest{
+			TheFilePaths:   fulls,
+			DestPath:       dstDir,
+			ConflictPolicy: policy.Enum(),
+		})
+		if err != nil {
+			return f.shouldRetry(ctx, err)
+		}
+		if !res.GetSuccess() {
+			return false, errors.New(res.GetErrorMessage())
+		}
+		return false, nil
+	})
+	return translateError(err)
+}
+
+// deleteFull deletes an absolute API path.
+func (f *Fs) deleteFull(ctx context.Context, p string) error {
+	ctx = f.withAuth(ctx)
+	err := f.pacer.Call(func() (bool, error) {
+		res, err := f.client.DeleteFile(ctx, &api.FileRequest{Path: p})
+		if err != nil {
+			return f.shouldRetry(ctx, err)
+		}
+		if !res.GetSuccess() {
+			return false, errors.New(res.GetErrorMessage())
+		}
+		return false, nil
+	})
+	return translateError(err)
 }
 
 // rename changes the base name of a path within its parent.
 func (f *Fs) rename(ctx context.Context, remote, newName string) error {
+	if err := f.checkPath(newName); err != nil {
+		return err
+	}
+	return f.renameFull(ctx, f.fullPath(remote), f.opt.Enc.FromStandardName(newName))
+}
+
+// renameFull renames an absolute API path to newName (already in API form).
+func (f *Fs) renameFull(ctx context.Context, full, newName string) error {
 	ctx = f.withAuth(ctx)
 	err := f.pacer.Call(func() (bool, error) {
-		req := &api.RenameFileRequest{
-			TheFilePath: f.fullPath(remote),
-			NewName:     f.opt.Enc.FromStandardName(newName),
-		}
-		res, err := f.client.RenameFile(ctx, req)
+		res, err := f.client.RenameFile(ctx, &api.RenameFileRequest{TheFilePath: full, NewName: newName})
 		if err != nil {
 			return f.shouldRetry(ctx, err)
 		}
@@ -722,10 +897,7 @@ func (f *Fs) rename(ctx context.Context, remote, newName string) error {
 		}
 		return false, nil
 	})
-	if err != nil {
-		return translateError(err)
-	}
-	return nil
+	return translateError(err)
 }
 
 // Hash of the object
