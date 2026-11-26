@@ -167,6 +167,76 @@ func TestCopyPreservesLiteralSlash(t *testing.T) {
 	assert.False(t, files[0].IsDir())
 }
 
+// CloudDrive's direct URLs (115 with 302 on) only work with the User-Agent
+// CloudDrive used to fetch them, which it returns in userAgent. rclone's
+// HTTP transport forces --user-agent onto every request, so Open must use a
+// client configured with that User-Agent.
+func TestOpenDirectURLUsesCloudDriveUserAgent(t *testing.T) {
+	const contents = "recording"
+	for _, tc := range []struct {
+		name   string
+		ua     *string
+		wantUA []string // nil: the header must be absent
+	}{
+		{name: "cloud drive agent", ua: proto.String("CloudDrive2/1.1.3 (Linux-X64)"), wantUA: []string{"CloudDrive2/1.1.3 (Linux-X64)"}},
+		{name: "empty agent", ua: proto.String(""), wantUA: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if got := r.Header.Values("User-Agent"); !assert.Equal(t, tc.wantUA, got) {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				_, _ = io.WriteString(w, contents)
+			}))
+			t.Cleanup(server.Close)
+			f := newEncodingTestFs(t)
+			f.root = "recordings"
+			f.httpClient = server.Client()
+			f.client = &encodingClient{download: func(req *api.GetDownloadUrlPathRequest) *api.DownloadUrlPathInfo {
+				assert.True(t, req.GetDirectUrl)
+				return &api.DownloadUrlPathInfo{DirectUrl: proto.String(server.URL + "/file"), UserAgent: tc.ua}
+			}}
+			o := &Object{fs: f, remote: "file.mp4", size: int64(len(contents)), known: true}
+			rc, err := o.Open(ctx)
+			require.NoError(t, err)
+			data, err := io.ReadAll(rc)
+			require.NoError(t, rc.Close())
+			require.NoError(t, err)
+			assert.Equal(t, contents, string(data))
+		})
+	}
+}
+
+// Without a direct URL the download goes through CloudDrive itself, with
+// the normal rclone client.
+func TestOpenWithoutDirectURLUsesDefaultClient(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "x")
+	}))
+	t.Cleanup(server.Close)
+	f := newEncodingTestFs(t)
+	used := false
+	f.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		used = true
+		return http.DefaultTransport.RoundTrip(r)
+	})}
+	f.client = &encodingClient{download: func(req *api.GetDownloadUrlPathRequest) *api.DownloadUrlPathInfo {
+		return &api.DownloadUrlPathInfo{DownloadUrlPath: server.URL + "/static/file"}
+	}}
+	o := &Object{fs: f, remote: "file.mp4", size: 1, known: true}
+	rc, err := o.Open(context.Background())
+	require.NoError(t, err)
+	_, _ = io.ReadAll(rc)
+	require.NoError(t, rc.Close())
+	assert.True(t, used)
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
 // opClient records the CloudDrive operations a backend call makes.
 type opClient struct {
 	api.CloudDriveFileSrvClient
@@ -274,9 +344,8 @@ func TestMoveAcrossDirsRenamesFirst(t *testing.T) {
 
 func TestMoveUsesSourceFsRoot(t *testing.T) {
 	f, c := newOpTestFs(t, "/other/x.m4a")
-	srcFs := *f
-	srcFs.root = "other"
-	src := &Object{fs: &srcFs, remote: "x.m4a"}
+	srcFs := &Fs{opt: f.opt, features: f.features, client: f.client, pacer: f.pacer, root: "other"}
+	src := &Object{fs: srcFs, remote: "x.m4a"}
 	_, err := f.Move(context.Background(), src, "x.m4a")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"move /other/x.m4a -> /rec Overwrite"}, c.calls)

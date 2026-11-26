@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"path"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/backend/clouddrive/api"
@@ -72,6 +73,9 @@ type Fs struct {
 	baseScheme string
 	baseHost   string
 	pacer      *fs.Pacer // pacer for API rate limiting and retries
+
+	uaMu      sync.Mutex
+	uaClients map[string]*http.Client // direct-URL clients keyed by the User-Agent CloudDrive requires
 }
 
 // Object describes a clouddrive object
@@ -976,7 +980,7 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 	}
 	fs.OpenOptionAddHTTPHeaders(req.Header, options)
 
-	resp, err := o.fs.httpClient.Do(req)
+	resp, err := o.fs.clientFor(ctx, urlInfo.userAgent).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1103,6 +1107,33 @@ func (f *Fs) statPath(ctx context.Context, remote string) (*api.CloudDriveFile, 
 type downloadInfo struct {
 	url     string
 	headers map[string]string
+	// userAgent is the User-Agent a direct URL must be fetched with, as
+	// returned by CloudDrive (nil: no requirement). 115 binds its download
+	// links to the User-Agent that requested them, so any other one,
+	// rclone's included, gets 403. An empty string means no header at all.
+	userAgent *string
+}
+
+// clientFor returns the HTTP client to download with. rclone's transport
+// overwrites the User-Agent header on every request with --user-agent, so a
+// required User-Agent needs a client built with it.
+func (f *Fs) clientFor(ctx context.Context, ua *string) *http.Client {
+	if ua == nil {
+		return f.httpClient
+	}
+	f.uaMu.Lock()
+	defer f.uaMu.Unlock()
+	if c, ok := f.uaClients[*ua]; ok {
+		return c
+	}
+	newCtx, ci := fs.AddConfig(ctx)
+	ci.UserAgent = *ua
+	c := fshttp.NewClient(newCtx)
+	if f.uaClients == nil {
+		f.uaClients = make(map[string]*http.Client)
+	}
+	f.uaClients[*ua] = c
+	return c
 }
 
 // getDownloadInfo resolves a download URL for a path.
@@ -1120,6 +1151,11 @@ func (f *Fs) getDownloadInfo(ctx context.Context, remote string) (info *download
 			return f.shouldRetry(ctx, err)
 		}
 		u := res.GetDirectUrl()
+		var ua *string
+		if u != "" && res.UserAgent != nil {
+			s := res.GetUserAgent()
+			ua = &s
+		}
 		if u == "" {
 			u = res.GetDownloadUrlPath()
 			u = strings.ReplaceAll(u, "{SCHEME}", f.baseScheme)
@@ -1137,10 +1173,7 @@ func (f *Fs) getDownloadInfo(ctx context.Context, remote string) (info *download
 		for k, v := range res.GetAdditionalHeaders() {
 			headers[k] = v
 		}
-		if ua := res.GetUserAgent(); ua != "" {
-			headers["User-Agent"] = ua
-		}
-		info = &downloadInfo{url: u, headers: headers}
+		info = &downloadInfo{url: u, headers: headers, userAgent: ua}
 		return false, nil
 	})
 
