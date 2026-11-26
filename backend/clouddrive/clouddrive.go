@@ -34,7 +34,10 @@ import (
 )
 
 const (
-	defaultChunkSize = 4 * 1024 * 1024
+	// defaultChunkSize must leave room for the request framing under
+	// CloudDrive's 4 MiB gRPC message limit: a 4 MiB buffer makes the
+	// server drop the stream and every file over 4 MiB fails with EOF.
+	defaultChunkSize = 1024 * 1024
 	defaultTimeout   = 30 * time.Second
 	minSleep         = 10 * time.Millisecond
 	maxSleep         = 2 * time.Second
@@ -567,9 +570,29 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 		return translateError(err)
 	}
 	handle := createRes.GetFileHandle()
+	if err := f.writeHandle(ctx, handle, in); err != nil {
+		// Don't leave an empty or truncated file behind.
+		if _, closeErr := f.client.CloseFile(ctx, &api.CloseFileRequest{FileHandle: handle}); closeErr != nil {
+			fs.Debugf(remote, "close file after failed upload: %v", closeErr)
+		}
+		if delErr := f.deleteFull(ctx, p); delErr != nil {
+			fs.Errorf(remote, "failed to remove incomplete upload: %v", delErr)
+		}
+		return err
+	}
 
+	// Ensure file is closed server-side
+	if _, err = f.client.CloseFile(ctx, &api.CloseFileRequest{FileHandle: handle}); err != nil {
+		// log but ignore since file might already be closed
+		fs.Debugf(remote, "close file warning: %v", err)
+	}
+	return nil
+}
+
+// writeHandle streams in to an open CloudDrive file handle.
+func (f *Fs) writeHandle(ctx context.Context, handle uint64, in io.Reader) error {
 	var stream api.CloudDriveFileSrv_WriteToFileStreamClient
-	err = f.pacer.Call(func() (bool, error) {
+	err := f.pacer.Call(func() (bool, error) {
 		var err2 error
 		stream, err2 = f.client.WriteToFileStream(ctx)
 		if err2 != nil {
@@ -580,61 +603,43 @@ func (f *Fs) put(ctx context.Context, in io.Reader, src fs.ObjectInfo, options .
 	if err != nil {
 		return translateError(err)
 	}
+	send := func(req *api.WriteFileRequest) error {
+		err := stream.Send(req)
+		if err == io.EOF {
+			// The server ended the stream: its status says why.
+			if _, recvErr := stream.CloseAndRecv(); recvErr != nil {
+				err = recvErr
+			}
+		}
+		return translateError(err)
+	}
 
 	buf := make([]byte, defaultChunkSize)
 	var offset uint64
 	for {
 		n, readErr := io.ReadFull(in, buf)
-		if readErr == io.ErrUnexpectedEOF || readErr == io.EOF {
-			if n > 0 {
-				if sendErr := stream.Send(&api.WriteFileRequest{
-					FileHandle: handle,
-					StartPos:   offset,
-					Length:     uint64(n),
-					Buffer:     buf[:n],
-					CloseFile:  true,
-				}); sendErr != nil {
-					return translateError(sendErr)
-				}
-				offset += uint64(n)
-			} else {
-				// If file is empty, still send a close to commit
-				if offset == 0 {
-					if sendErr := stream.Send(&api.WriteFileRequest{
-						FileHandle: handle,
-						StartPos:   0,
-						Length:     0,
-						CloseFile:  true,
-					}); sendErr != nil {
-						return translateError(sendErr)
-					}
-				}
-			}
-			break
-		}
-		if readErr != nil {
+		last := readErr == io.ErrUnexpectedEOF || readErr == io.EOF
+		if readErr != nil && !last {
 			return readErr
 		}
-
-		if sendErr := stream.Send(&api.WriteFileRequest{
-			FileHandle: handle,
-			StartPos:   offset,
-			Length:     uint64(n),
-			Buffer:     buf[:n],
-		}); sendErr != nil {
-			return translateError(sendErr)
+		if n > 0 || (last && offset == 0) {
+			if err := send(&api.WriteFileRequest{
+				FileHandle: handle,
+				StartPos:   offset,
+				Length:     uint64(n),
+				Buffer:     buf[:n],
+				CloseFile:  last,
+			}); err != nil {
+				return err
+			}
+			offset += uint64(n)
 		}
-		offset += uint64(n)
+		if last {
+			break
+		}
 	}
-
-	if _, err = stream.CloseAndRecv(); err != nil {
+	if _, err := stream.CloseAndRecv(); err != nil {
 		return translateError(err)
-	}
-
-	// Ensure file is closed server-side
-	if _, err = f.client.CloseFile(ctx, &api.CloseFileRequest{FileHandle: handle}); err != nil {
-		// log but ignore since file might already be closed
-		fs.Debugf(remote, "close file warning: %v", err)
 	}
 	return nil
 }
@@ -984,8 +989,33 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 }
 
 // Update the object with contents of io.Reader
+//
+// CloudDrive cannot open an existing file for writing (CreateFile fails
+// with AlreadyExists), so upload under a temporary name next to it, then
+// replace the old file with it.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	return o.fs.put(ctx, in, src, options...)
+	f := o.fs
+	tmp := o.remote + ".rclone-update"
+	if err := f.put(ctx, in, fs.NewOverrideRemote(src, tmp), options...); err != nil {
+		return err
+	}
+	full := f.fullPath(o.remote)
+	if err := f.deleteFull(ctx, full); err != nil && !errors.Is(err, fs.ErrorObjectNotFound) {
+		if delErr := f.deleteFull(ctx, f.fullPath(tmp)); delErr != nil {
+			fs.Errorf(tmp, "failed to remove temporary upload: %v", delErr)
+		}
+		return err
+	}
+	_, leaf := splitFull(full)
+	if err := f.renameFull(ctx, f.fullPath(tmp), leaf); err != nil {
+		return err
+	}
+	item, err := f.getFile(ctx, o.remote)
+	if err != nil {
+		return err
+	}
+	o.populateFromItem(item)
+	return nil
 }
 
 // Remove deletes the object

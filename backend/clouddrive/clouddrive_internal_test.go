@@ -1,6 +1,7 @@
 package clouddrive
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -9,12 +10,14 @@ import (
 	"path"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/rclone/rclone/backend/clouddrive/api"
 	"github.com/rclone/rclone/backend/local"
 	"github.com/rclone/rclone/fs"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/object"
 	"github.com/rclone/rclone/fs/operations"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
@@ -23,6 +26,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 type encodingClient struct {
@@ -317,4 +321,124 @@ func TestCopyNewLeafClash(t *testing.T) {
 	_, err := f.Copy(context.Background(), src, "b/new.m4a")
 	assert.ErrorIs(t, err, fs.ErrorCantCopy)
 	assert.Empty(t, c.calls)
+}
+
+// uploadClient emulates CloudDrive's upload calls, including its 4 MiB
+// gRPC message limit.
+type uploadClient struct {
+	opClient
+	written map[string][]byte
+	handles map[uint64]string
+	next    uint64
+	maxMsg  int
+	sent    []int
+}
+
+func newUploadClient(existing ...string) *uploadClient {
+	c := &uploadClient{written: map[string][]byte{}, handles: map[uint64]string{}, maxMsg: 4 << 20}
+	c.existing = map[string]bool{}
+	for _, p := range existing {
+		c.existing[p] = true
+	}
+	return c
+}
+
+func (c *uploadClient) CreateFile(_ context.Context, req *api.CreateFileRequest, _ ...grpc.CallOption) (*api.CreateFileResult, error) {
+	p := joinFull(req.ParentPath, req.FileName)
+	c.calls = append(c.calls, "create "+p)
+	if c.existing[p] {
+		return nil, status.Error(codes.AlreadyExists, "exists")
+	}
+	c.existing[p] = true
+	c.next++
+	c.handles[c.next] = p
+	return &api.CreateFileResult{FileHandle: c.next}, nil
+}
+
+func (c *uploadClient) CloseFile(_ context.Context, req *api.CloseFileRequest, _ ...grpc.CallOption) (*api.FileOperationResult, error) {
+	return &api.FileOperationResult{Success: true}, nil
+}
+
+func (c *uploadClient) WriteToFileStream(_ context.Context, _ ...grpc.CallOption) (api.CloudDriveFileSrv_WriteToFileStreamClient, error) {
+	return &uploadStream{c: c}, nil
+}
+
+type uploadStream struct {
+	grpc.ClientStream
+	c      *uploadClient
+	broken bool
+}
+
+func (s *uploadStream) Send(req *api.WriteFileRequest) error {
+	size := proto.Size(req)
+	s.c.sent = append(s.c.sent, size)
+	if size > s.c.maxMsg {
+		s.broken = true
+		return io.EOF
+	}
+	p := s.c.handles[req.FileHandle]
+	s.c.written[p] = append(s.c.written[p], req.Buffer...)
+	return nil
+}
+
+func (s *uploadStream) CloseAndRecv() (*api.WriteFileResult, error) {
+	if s.broken {
+		return nil, status.Error(codes.ResourceExhausted, "grpc: received message larger than max")
+	}
+	return &api.WriteFileResult{}, nil
+}
+
+func (c *uploadClient) RenameFile(ctx context.Context, req *api.RenameFileRequest, opts ...grpc.CallOption) (*api.FileOperationResult, error) {
+	parent, _ := splitFull(req.TheFilePath)
+	c.written[joinFull(parent, req.NewName)] = c.written[req.TheFilePath]
+	delete(c.written, req.TheFilePath)
+	return c.opClient.RenameFile(ctx, req, opts...)
+}
+
+func (c *uploadClient) DeleteFile(ctx context.Context, req *api.FileRequest, opts ...grpc.CallOption) (*api.FileOperationResult, error) {
+	delete(c.written, req.Path)
+	return c.opClient.DeleteFile(ctx, req, opts...)
+}
+
+func newUploadTestFs(t *testing.T, c *uploadClient) *Fs {
+	f := newEncodingTestFs(t)
+	f.root = "rec"
+	f.client = c
+	return f
+}
+
+func TestPutLargeFileFitsMessageLimit(t *testing.T) {
+	c := newUploadClient()
+	f := newUploadTestFs(t, c)
+	data := bytes.Repeat([]byte("x"), 9<<20+123)
+	src := object.NewStaticObjectInfo("a.m4a", time.Now(), int64(len(data)), true, nil, nil)
+	require.NoError(t, f.put(context.Background(), bytes.NewReader(data), src))
+	assert.Equal(t, data, c.written["/rec/a.m4a"])
+	for _, n := range c.sent {
+		assert.LessOrEqual(t, n, c.maxMsg)
+	}
+}
+
+func TestPutFailureRemovesEmptyFile(t *testing.T) {
+	c := newUploadClient()
+	c.maxMsg = 1000 // force the server to drop the stream
+	f := newUploadTestFs(t, c)
+	data := bytes.Repeat([]byte("x"), 5000)
+	src := object.NewStaticObjectInfo("a.m4a", time.Now(), int64(len(data)), true, nil, nil)
+	err := f.put(context.Background(), bytes.NewReader(data), src)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "larger than max", "the server's status, not a bare EOF")
+	assert.False(t, c.existing["/rec/a.m4a"], "empty file left behind")
+	assert.Contains(t, c.calls, "delete /rec/a.m4a")
+}
+
+func TestUpdateReplacesExistingFile(t *testing.T) {
+	c := newUploadClient("/rec/a.m4a")
+	c.written["/rec/a.m4a"] = []byte("old")
+	f := newUploadTestFs(t, c)
+	o := &Object{fs: f, remote: "a.m4a"}
+	src := object.NewStaticObjectInfo("a.m4a", time.Now(), 3, true, nil, nil)
+	require.NoError(t, o.Update(context.Background(), bytes.NewReader([]byte("new")), src))
+	assert.Equal(t, []byte("new"), c.written["/rec/a.m4a"])
+	assert.False(t, c.existing["/rec/a.m4a.rclone-update"])
 }
