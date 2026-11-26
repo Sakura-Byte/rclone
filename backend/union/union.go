@@ -697,19 +697,37 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 		}
 		entriesList[i] = uEntries
 	})
-	if len(errs) == len(errs.FilterNil()) {
-		errs = errs.Map(func(e error) error {
-			if errors.Is(e, fs.ErrorDirNotFound) {
-				return nil
-			}
-			return e
-		})
-		if len(errs) == 0 {
-			return nil, fs.ErrorDirNotFound
-		}
-		return nil, errs.Err()
+	if err := listResult(errs); err != nil {
+		return nil, err
 	}
 	return f.mergeDirEntries(entriesList)
+}
+
+// listResult turns the per-upstream errors of a listing into its result.
+//
+// A directory missing from some upstreams is normal. Any other upstream
+// error fails the whole listing: returning only the other upstreams'
+// entries makes the files on the failed upstream look absent, so copy
+// uploads them again through the create policy and sync deletes them.
+func listResult(errs Errors) error {
+	missing := 0
+	var real Errors
+	for _, e := range errs {
+		switch {
+		case e == nil:
+		case errors.Is(e, fs.ErrorDirNotFound):
+			missing++
+		default:
+			real = append(real, e)
+		}
+	}
+	if len(real) > 0 {
+		return real.Err()
+	}
+	if missing == len(errs) {
+		return fs.ErrorDirNotFound
+	}
+	return nil
 }
 
 // ListR lists the objects and directories of the Fs starting
@@ -756,17 +774,8 @@ func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) (
 			return
 		}
 	})
-	if len(errs) == len(errs.FilterNil()) {
-		errs = errs.Map(func(e error) error {
-			if errors.Is(e, fs.ErrorDirNotFound) {
-				return nil
-			}
-			return e
-		})
-		if len(errs) == 0 {
-			return fs.ErrorDirNotFound
-		}
-		return errs.Err()
+	if err := listResult(errs); err != nil {
+		return err
 	}
 	entries, err := f.mergeDirEntries(entriesList)
 	if err != nil {
@@ -989,7 +998,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		WriteDirSetModTime:       true,
 		UserDirMetadata:          true,
 		DirModTimeUpdatesOnWrite: true,
-		PartialUploads:           true,
+		// Partial uploads go through the create policy, so replacing a
+		// file that lives on another upstream would leave the old copy
+		// there and create a second one. Without them rclone updates the
+		// existing object in place through the action policy.
+		PartialUploads: false,
 	}).Fill(ctx, f)
 	canMove, slowHash := true, false
 	for _, f := range upstreams {
